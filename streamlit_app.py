@@ -119,6 +119,22 @@ def _to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+def _read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
+    """Attempt to read a CSV trying multiple encodings commonly used in SOD files."""
+
+    encodings = ("utf-8", "cp1252", "latin-1")
+    last_error: Optional[Exception] = None
+    for encoding in encodings:
+        try:
+            return pd.read_csv(csv_path, encoding=encoding)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+    raise last_error or UnicodeDecodeError(
+        "utf-8", b"", 0, 1, "Failed to decode CSV with fallback encodings."
+    )
+
+
 @st.cache_data(show_spinner=True)
 def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
     if not file_paths:
@@ -129,7 +145,7 @@ def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
         csv_path = Path(path_str)
         if not csv_path.exists():
             continue
-        df = pd.read_csv(csv_path)
+        df = _read_csv_with_fallback(csv_path)
         df.columns = [col.strip().upper() for col in df.columns]
         df["SOURCE_FILE"] = csv_path.name
 
