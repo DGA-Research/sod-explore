@@ -98,6 +98,25 @@ def infer_year(name: str) -> Optional[int]:
     return None
 
 
+def infer_year_from_file(csv_path: Path) -> Optional[int]:
+    """Fallback: peek inside the CSV and capture the first year token."""
+
+    try:
+        with csv_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            # Skip header
+            header = handle.readline()
+            for _ in range(5):  # Inspect a few lines in case of blanks
+                line = handle.readline()
+                if not line:
+                    break
+                match = re.search(r"(20\d{2}|19\d{2})", line)
+                if match:
+                    return int(match.group(1))
+    except OSError:
+        return None
+    return None
+
+
 @st.cache_data(show_spinner=False)
 def discover_files(data_dir_str: str) -> List[FileMeta]:
     data_dir = Path(data_dir_str)
@@ -107,6 +126,8 @@ def discover_files(data_dir_str: str) -> List[FileMeta]:
     files: List[FileMeta] = []
     for csv_path in sorted(data_dir.glob("*.csv")):
         year = infer_year(csv_path.name)
+        if year is None:
+            year = infer_year_from_file(csv_path)
         quarter_code, quarter_label = infer_quarter_bits(csv_path.name)
         data_type = infer_data_type(csv_path.name)
         files.append(
