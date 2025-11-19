@@ -41,6 +41,7 @@ QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
 ]
 
 QUARTER_SORT_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+DATE_FORMATS = ("%d-%b-%y", "%d-%b-%Y", "%m/%d/%Y")
 
 
 @dataclass
@@ -135,6 +136,16 @@ def _read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
     )
 
 
+def _parse_dates(series: pd.Series) -> pd.Series:
+    """Parse date strings using the most common SOD formats before falling back."""
+
+    for fmt in DATE_FORMATS:
+        parsed = pd.to_datetime(series, format=fmt, errors="coerce")
+        if not parsed.isna().all():
+            return parsed
+    return pd.to_datetime(series, errors="coerce")
+
+
 @st.cache_data(show_spinner=True)
 def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
     if not file_paths:
@@ -153,7 +164,7 @@ def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
             df["AMOUNT"] = _to_numeric(df["AMOUNT"])
             for date_col in ("TRANSACTION DATE", "PERFORM START DT", "PERFORM END DT"):
                 if date_col in df.columns:
-                    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                    df[date_col] = _parse_dates(df[date_col])
         else:
             for value_col in ("QTD AMOUNT", "YTD AMOUNT"):
                 if value_col in df.columns:
