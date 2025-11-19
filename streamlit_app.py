@@ -207,10 +207,22 @@ def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta]]:
         option_labels.append(label)
         label_to_files[label] = metas
 
+    default_selection: List[str] = []
+    known_years = [year for year in sorted_years if year is not None]
+    if known_years:
+        latest_year = max(known_years)
+        label_prefix = year_label(latest_year)
+        for label in option_labels:
+            if label.startswith(label_prefix):
+                default_selection = [label]
+                break
+    elif option_labels:
+        default_selection = [option_labels[-1]]
+
     selected_labels = st.sidebar.multiselect(
         "Reporting years",
         options=option_labels,
-        default=option_labels,
+        default=default_selection,
     )
     selected_files = [meta for label in selected_labels for meta in label_to_files.get(label, [])]
 
