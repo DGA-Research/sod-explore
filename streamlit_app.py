@@ -9,10 +9,11 @@ load, exposes sidebar filters, and visualizes the filtered slice. Launch with:
 
 from __future__ import annotations
 
+import io
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 from zipfile import ZipFile
 
 import pandas as pd
@@ -472,6 +473,58 @@ def render_data_preview(df: pd.DataFrame) -> None:
     )
 
 
+def stream_filtered_detail_csv(
+    csv_paths: List[str], filters: Dict[str, object], chunk_size: int = 100_000
+) -> bytes:
+    """Read detail CSVs in chunks, apply filters, and return the concatenated CSV bytes."""
+
+    output_buffer = io.StringIO()
+    header_written = False
+    total_rows = 0
+
+    for path_str in csv_paths:
+        csv_path = Path(path_str)
+        if not csv_path.exists():
+            continue
+
+        chunk_iter = pd.read_csv(
+            csv_path,
+            encoding="utf-8",
+            low_memory=False,
+            chunksize=chunk_size,
+        )
+
+        for chunk in chunk_iter:
+            chunk.columns = [col.strip().upper() for col in chunk.columns]
+            chunk["SOURCE_FILE"] = csv_path.name
+
+            if "PERSON" not in chunk.columns and "ORGANIZATION" in chunk.columns:
+                chunk["PERSON"] = chunk["ORGANIZATION"].apply(extract_person_name)
+
+            if "AMOUNT" in chunk.columns:
+                chunk["AMOUNT"] = _to_numeric(chunk["AMOUNT"])
+            if "TRANSACTION DATE" in chunk.columns:
+                chunk["TRANSACTION DATE"] = _parse_dates(chunk["TRANSACTION DATE"])
+
+            subset = apply_filters(chunk, filters, "Detail")
+            if subset.empty:
+                continue
+
+            subset.to_csv(
+                output_buffer,
+                index=False,
+                header=not header_written,
+                mode="a",
+            )
+            header_written = True
+            total_rows += len(subset)
+
+    if total_rows == 0:
+        raise ValueError("No detail rows match the current filters.")
+
+    return output_buffer.getvalue().encode("utf-8")
+
+
 def render_detail_download_sidebar(
     all_files: List[FileMeta], selected_years: List[int], filters: Dict[str, object]
 ) -> None:
@@ -492,22 +545,16 @@ def render_detail_download_sidebar(
             st.caption("Click to generate a CSV of detail records matching your filters.")
             return
 
-        detail_paths = tuple(str(meta.path) for meta in detail_files)
-        with st.spinner("Loading detail records…"):
-            detail_df = load_data(detail_paths, "Detail")
-
-        if detail_df.empty:
-            st.info("The selected detail files did not contain any rows.")
-            return
-
+        detail_paths = [str(meta.path) for meta in detail_files]
         detail_filters = dict(filters)
         detail_filters["amount_column"] = "AMOUNT"
-        detail_filtered = apply_filters(detail_df, detail_filters, "Detail")
-        if detail_filtered.empty:
-            st.info("No detail rows match the current filters.")
+
+        try:
+            csv_bytes = stream_filtered_detail_csv(detail_paths, detail_filters)
+        except ValueError as exc:
+            st.info(str(exc))
             return
 
-        csv_bytes = detail_filtered.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download detailed summary",
             data=csv_bytes,
