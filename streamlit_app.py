@@ -10,6 +10,7 @@ load, exposes sidebar filters, and visualizes the filtered slice. Launch with:
 from __future__ import annotations
 
 import io
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,8 +20,17 @@ from zipfile import ZipFile
 import pandas as pd
 import streamlit as st
 
+try:  # Optional dependency for GCS access.
+    import gcsfs  # type: ignore
+except ImportError:  # pragma: no cover - handled in UI
+    gcsfs = None
+
 # Default location that ships with the repository.
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "SOD_Bulk"
+
+# Limit for how many categorical options we surface as multiselects before
+# falling back to text queries to avoid rendering massive lists.
+SIDEBAR_OPTION_LIMIT = 500
 
 # Tokens that help infer reporting quarter from a file name.
 QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
@@ -47,13 +57,32 @@ PERSON_PREFIX_PATTERN = re.compile(
     r"^(THE\s+HONORABLE|THE\s+HON\.|HONORABLE|HON\.?|REPRESENTATIVE|REP\.?|SENATOR|SEN\.?|DELEGATE|DEL\.?|RESIDENT\s+COMMISSIONER)\s+",
     re.IGNORECASE,
 )
+REMOTE_SCHEMES = ("gs://",)
+
+
+def _is_remote_path(path_str: str) -> bool:
+    return any(path_str.startswith(prefix) for prefix in REMOTE_SCHEMES)
+
+
+def _extract_filename(path_str: str) -> str:
+    if not path_str:
+        return ""
+    if _is_remote_path(path_str):
+        return path_str.rstrip("/").split("/")[-1]
+    return Path(path_str).name
+
+
+def _path_exists(path_str: str) -> bool:
+    if _is_remote_path(path_str):
+        return True
+    return Path(path_str).exists()
 
 
 @dataclass
 class FileMeta:
     """Metadata about one CSV file on disk."""
 
-    path: Path
+    path: str
     data_type: str  # Detail or Summary
     year: Optional[int]
     quarter: Optional[str]
@@ -63,13 +92,17 @@ class FileMeta:
     def label(self) -> str:
         year_txt = str(self.year) if self.year else "Year ?"
         quarter_txt = self.quarter_label or "Quarter ?"
-        return f"{year_txt} {quarter_txt} • {self.data_type} • {self.path.name}"
+        return f"{year_txt} {quarter_txt} • {self.data_type} • {self.filename}"
+
+    @property
+    def filename(self) -> str:
+        return _extract_filename(self.path)
 
     @property
     def sort_key(self) -> Tuple[int, int, str]:
         year_val = self.year or 0
         quarter_val = QUARTER_SORT_ORDER.get(self.quarter or "", 0)
-        return (year_val, quarter_val, self.path.name)
+        return (year_val, quarter_val, self.filename)
 
 
 def normalize_name(name: str) -> str:
@@ -117,22 +150,18 @@ def infer_year_from_file(csv_path: Path) -> Optional[int]:
     return None
 
 
-@st.cache_data(show_spinner=False)
-def discover_files(data_dir_str: str) -> List[FileMeta]:
-    data_dir = Path(data_dir_str)
-    if not data_dir.exists():
-        return []
-
+def _build_file_meta(csv_paths: Iterable[str]) -> List[FileMeta]:
     files: List[FileMeta] = []
-    for csv_path in sorted(data_dir.glob("*.csv")):
-        year = infer_year(csv_path.name)
-        if year is None:
-            year = infer_year_from_file(csv_path)
-        quarter_code, quarter_label = infer_quarter_bits(csv_path.name)
-        data_type = infer_data_type(csv_path.name)
+    for path_str in csv_paths:
+        filename = _extract_filename(path_str)
+        year = infer_year(filename)
+        if year is None and not _is_remote_path(path_str):
+            year = infer_year_from_file(Path(path_str))
+        quarter_code, quarter_label = infer_quarter_bits(filename)
+        data_type = infer_data_type(filename)
         files.append(
             FileMeta(
-                path=csv_path,
+                path=path_str,
                 data_type=data_type,
                 year=year,
                 quarter=quarter_code,
@@ -140,6 +169,59 @@ def discover_files(data_dir_str: str) -> List[FileMeta]:
             )
         )
     return sorted(files, key=lambda meta: meta.sort_key)
+
+
+@st.cache_data(show_spinner=False)
+def discover_local_files(data_dir_str: str) -> List[FileMeta]:
+    data_dir = Path(data_dir_str)
+    if not data_dir.exists():
+        return []
+
+    csv_paths = [str(path) for path in sorted(data_dir.glob("*.csv"))]
+    return _build_file_meta(csv_paths)
+
+
+@st.cache_resource(show_spinner=False)
+def _get_gcs_filesystem(service_account_json: Optional[str]):
+    if gcsfs is None:  # pragma: no cover - surfaced via UI
+        raise RuntimeError("gcsfs is not installed. Run `pip install gcsfs`.")
+
+    token = json.loads(service_account_json) if service_account_json else None
+    return gcsfs.GCSFileSystem(token=token)
+
+
+@st.cache_data(show_spinner=True)
+def discover_gcs_files(
+    bucket: str, prefix: str, service_account_json: Optional[str]
+) -> List[FileMeta]:
+    bucket = bucket.strip()
+    if bucket.startswith("gs://"):
+        bucket = bucket[5:]
+    if not bucket:
+        return []
+
+    prefix = prefix.strip().lstrip("/")
+    search_root = f"{bucket}/{prefix}" if prefix else bucket
+
+    try:
+        fs = _get_gcs_filesystem(service_account_json)
+    except Exception as exc:  # pragma: no cover - surfaced via UI
+        st.sidebar.error(f"GCS authentication failed: {exc}")
+        return []
+
+    try:
+        objects = fs.find(search_root)
+    except FileNotFoundError:
+        st.sidebar.error(f"Bucket or prefix not found: {search_root}")
+        return []
+    except Exception as exc:  # pragma: no cover
+        st.sidebar.error(f"Failed to list gs://{search_root}: {exc}")
+        return []
+
+    csv_paths = sorted(f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv"))
+    if not csv_paths:
+        return []
+    return _build_file_meta(csv_paths)
 
 
 def _to_numeric(series: pd.Series) -> pd.Series:
@@ -217,12 +299,11 @@ def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
 
     frames: List[pd.DataFrame] = []
     for path_str in file_paths:
-        csv_path = Path(path_str)
-        if not csv_path.exists():
+        if not _path_exists(path_str):
             continue
-        df = _read_csv_with_fallback(csv_path)
+        df = _read_csv_with_fallback(path_str)
         df.columns = [col.strip().upper() for col in df.columns]
-        df["SOURCE_FILE"] = csv_path.name
+        df["SOURCE_FILE"] = _extract_filename(path_str)
         if "ORGANIZATION" in df.columns and "PERSON" not in df.columns:
             df["PERSON"] = df["ORGANIZATION"].apply(extract_person_name)
 
@@ -243,7 +324,7 @@ def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta], List[int]]:
+def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta], List[Optional[int]]]:
     st.sidebar.header("Dataset")
 
     data_type = st.sidebar.selectbox("Data type", options=["Summary", "Detail"], index=0)
@@ -290,13 +371,14 @@ def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta], 
         default=default_selection,
     )
     selected_files = [meta for label in selected_labels for meta in label_to_files.get(label, [])]
+    selected_years_set = {
+        meta.year
+        for label in selected_labels
+        for meta in label_to_files.get(label, [])
+    }
     selected_years = sorted(
-        {
-            meta.year
-            for label in selected_labels
-            for meta in label_to_files.get(label, [])
-            if meta.year is not None
-        }
+        selected_years_set,
+        key=lambda year: (1 if year is None else 0, year or 0),
     )
 
     st.sidebar.caption("Tip: limit selections if you run into memory constraints.")
@@ -312,7 +394,10 @@ def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]
 
     if "PERSON" in df.columns and df["PERSON"].notna().any():
         person_options = sorted(df["PERSON"].dropna().unique())
-        filters["person"] = st.sidebar.multiselect("Person", options=person_options)
+        if len(person_options) > SIDEBAR_OPTION_LIMIT:
+            filters["person_query"] = st.sidebar.text_input("Person contains")
+        else:
+            filters["person"] = st.sidebar.multiselect("Person", options=person_options)
 
     for column_label, filter_key in (
         ("ORGANIZATION", "organization"),
@@ -322,7 +407,10 @@ def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]
     ):
         if column_label in df.columns:
             options = sorted(df[column_label].dropna().unique())
-            filters[filter_key] = st.sidebar.multiselect(column_label.title(), options=options)
+            if len(options) > SIDEBAR_OPTION_LIMIT:
+                filters[f"{filter_key}_query"] = st.sidebar.text_input(f"{column_label.title()} contains")
+            else:
+                filters[filter_key] = st.sidebar.multiselect(column_label.title(), options=options)
 
     if data_type == "Detail" and "VENDOR NAME" in df.columns:
         filters["vendor_query"] = st.sidebar.text_input("Vendor contains")
@@ -377,9 +465,16 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, object], data_type: str) 
         "person": "PERSON",
     }
     for key, column in column_map.items():
+        if column not in filtered.columns:
+            continue
         values = filters.get(key)
         if values:
             filtered = filtered[filtered[column].isin(values)]
+        query_value = filters.get(f"{key}_query")
+        if query_value:
+            filtered = filtered[
+                filtered[column].astype(str).str.contains(str(query_value), case=False, na=False)
+            ]
 
     vendor_query = filters.get("vendor_query")
     if vendor_query and "VENDOR NAME" in filtered.columns:
@@ -480,18 +575,39 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
     st.bar_chart(org_chart)
 
 
-def render_data_preview(df: pd.DataFrame) -> None:
+def render_data_preview(
+    df: pd.DataFrame, data_type: str, selected_paths: Tuple[str, ...], filters: Dict[str, object]
+) -> None:
     st.subheader("Filtered rows")
     st.caption(f"{len(df):,} rows displayed (showing first 1,000).")
     st.dataframe(df.head(1000))
 
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download filtered CSV",
-        data=csv_bytes,
-        file_name="sod_filtered.csv",
-        mime="text/csv",
-    )
+    if data_type == "Detail":
+        st.caption("Downloading detail rows uses the streaming pipeline to avoid memory spikes.")
+        if st.button("Prepare filtered CSV", key="detail_preview_prepare"):
+            detail_filters = dict(filters)
+            detail_filters["amount_column"] = "AMOUNT"
+            try:
+                csv_bytes = stream_filtered_detail_csv(list(selected_paths), detail_filters)
+            except ValueError as exc:
+                st.info(str(exc))
+                return
+
+            st.download_button(
+                "Download filtered CSV",
+                data=csv_bytes,
+                file_name="sod_detail_filtered.csv",
+                mime="text/csv",
+                key="detail_preview_download",
+            )
+    else:
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download filtered CSV",
+            data=csv_bytes,
+            file_name="sod_filtered.csv",
+            mime="text/csv",
+        )
 
 
 def stream_filtered_detail_csv(
@@ -504,13 +620,12 @@ def stream_filtered_detail_csv(
     total_rows = 0
 
     for path_str in csv_paths:
-        csv_path = Path(path_str)
-        if not csv_path.exists():
+        if not _path_exists(path_str):
             continue
 
-        for chunk in _iter_csv_chunks(csv_path, chunk_size):
+        for chunk in _iter_csv_chunks(path_str, chunk_size):
             chunk.columns = [col.strip().upper() for col in chunk.columns]
-            chunk["SOURCE_FILE"] = csv_path.name
+            chunk["SOURCE_FILE"] = _extract_filename(path_str)
 
             if "PERSON" not in chunk.columns and "ORGANIZATION" in chunk.columns:
                 chunk["PERSON"] = chunk["ORGANIZATION"].apply(extract_person_name)
@@ -539,7 +654,7 @@ def stream_filtered_detail_csv(
     return output_buffer.getvalue().encode("utf-8")
 
 
-def _iter_csv_chunks(csv_path: Path, chunk_size: int) -> Iterable[pd.DataFrame]:
+def _iter_csv_chunks(csv_path: str, chunk_size: int) -> Iterable[pd.DataFrame]:
     """Yield DataFrame chunks using the same encoding fallback as bulk loading."""
 
     encodings = ("utf-8", "cp1252", "latin-1")
@@ -561,12 +676,12 @@ def _iter_csv_chunks(csv_path: Path, chunk_size: int) -> Iterable[pd.DataFrame]:
             continue
 
     raise last_error or UnicodeDecodeError(
-        "utf-8", b"", 0, 1, f"Failed to decode {csv_path.name} with fallback encodings."
+        "utf-8", b"", 0, 1, f"Failed to decode {_extract_filename(csv_path)} with fallback encodings."
     )
 
 
 def render_detail_download_sidebar(
-    all_files: List[FileMeta], selected_years: List[int], filters: Dict[str, object]
+    all_files: List[FileMeta], selected_years: List[Optional[int]], filters: Dict[str, object]
 ) -> None:
     expander = st.sidebar.expander("Detailed summary download", expanded=False)
     with expander:
@@ -638,18 +753,48 @@ def main() -> None:
     st.title("Statement of Disbursements Explorer")
     st.caption("Interactively analyze SOD summary/detail CSV files with custom filters.")
 
-    data_dir_input = st.sidebar.text_input(
-        "SOD data folder", value=str(DEFAULT_DATA_DIR), help="Path containing the raw CSV files."
-    )
-    data_dir = ensure_data_directory(data_dir_input)
-    if not data_dir:
-        st.error("Unable to locate or extract the data directory. Check the path or zip file.")
-        st.stop()
+    data_source = st.sidebar.radio("Data source", options=["Local folder", "GCS bucket"], index=0)
+    files: List[FileMeta] = []
 
-    files = discover_files(str(data_dir))
+    if data_source == "Local folder":
+        data_dir_input = st.sidebar.text_input(
+            "SOD data folder",
+            value=str(DEFAULT_DATA_DIR),
+            help="Path containing the raw CSV files.",
+        )
+        data_dir = ensure_data_directory(data_dir_input)
+        if not data_dir:
+            st.error("Unable to locate or extract the data directory. Check the path or zip file.")
+            st.stop()
+        files = discover_local_files(str(data_dir))
+    else:
+        gcs_bucket = st.sidebar.text_input("GCS bucket", value="", help="Example: my-bucket-name")
+        gcs_prefix = st.sidebar.text_input(
+            "Object prefix (optional)",
+            value="",
+            help="Example: sod/detail/2024_Q1/",
+        )
+        service_account_input = st.sidebar.text_area(
+            "Service account JSON (optional)",
+            value="",
+            height=120,
+            help="Leave blank to use Application Default Credentials or a gcp_service_account secret.",
+        )
+        service_account_json = service_account_input.strip() or None
+        try:
+            secret_account = st.secrets.get("gcp_service_account")  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - secrets unavailable locally
+            secret_account = None
+        if not service_account_json and secret_account:
+            service_account_json = json.dumps(secret_account)
+            st.sidebar.caption("Using gcp_service_account from Streamlit secrets.")
+        files = discover_gcs_files(gcs_bucket, gcs_prefix, service_account_json)
 
     if not files:
-        st.error("No CSV files detected. Confirm the folder path and retry.")
+        if data_source == "Local folder":
+            st.error("No CSV files detected. Confirm the folder path and retry.")
+        else:
+            st.error("No CSV files detected in the specified bucket/prefix.")
         st.stop()
 
     data_type, selected_files, selected_years = sidebar_dataset_picker(files)
@@ -674,7 +819,7 @@ def main() -> None:
     else:
         render_summary_view(filtered_df, amount_column)
 
-    render_data_preview(filtered_df)
+    render_data_preview(filtered_df, data_type, selected_paths, filters)
     render_detail_download_sidebar(files, selected_years, filters)
 
 
