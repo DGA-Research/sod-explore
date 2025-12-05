@@ -34,8 +34,8 @@ SIDEBAR_OPTION_LIMIT = 500
 
 # Default remote profile used when no secrets-based entry exists.
 DEFAULT_GCS_PROFILE = {
-    "bucket": "my-prod-bucket",
-    "prefix": "sod/detail/",
+    "bucket": "sod-files",
+    "prefix": "",  # or e.g. "detail/" if you keep data in a subfolder
     "service_account_json": None,
 }
 
