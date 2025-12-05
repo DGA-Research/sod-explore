@@ -87,6 +87,21 @@ def _get_secret_dict(key: str) -> Dict[str, Dict[str, object]]:
     return value if isinstance(value, dict) else {}
 
 
+def _serialize_secret_mapping(secret_obj: object) -> Optional[str]:
+    if secret_obj is None:
+        return None
+    if isinstance(secret_obj, str):
+        return secret_obj.strip() or None
+    if hasattr(secret_obj, "to_dict"):
+        secret_obj = secret_obj.to_dict()  # type: ignore[attr-defined]
+    if isinstance(secret_obj, dict):
+        return json.dumps(secret_obj)
+    try:
+        return json.dumps(secret_obj)
+    except TypeError:
+        return None
+
+
 def get_configured_gcs_sources() -> Dict[str, Dict[str, str]]:
     sources = _get_secret_dict("gcs_sources")
     normalized: Dict[str, Dict[str, str]] = {}
@@ -96,10 +111,11 @@ def get_configured_gcs_sources() -> Dict[str, Dict[str, str]]:
         bucket = str(config.get("bucket", "")).strip()
         if not bucket:
             continue
+        sa_value = config.get("service_account_json", "")
         normalized[name] = {
             "bucket": bucket,
             "prefix": str(config.get("prefix", "") or "").strip(),
-            "service_account_json": str(config.get("service_account_json", "") or "").strip(),
+            "service_account_json": (_serialize_secret_mapping(sa_value) or "").strip(),
         }
     return normalized
 
@@ -829,8 +845,8 @@ def main() -> None:
                 secret_account = st.secrets.get("gcp_service_account")  # type: ignore[attr-defined]
             except Exception:  # pragma: no cover - secrets unavailable locally
                 secret_account = None
-            if secret_account:
-                service_account_json = json.dumps(secret_account)
+            service_account_json = _serialize_secret_mapping(secret_account)
+            if service_account_json:
                 st.sidebar.caption("Using gcp_service_account from Streamlit secrets.")
         files = discover_gcs_files(gcs_bucket, gcs_prefix, service_account_json)
 
