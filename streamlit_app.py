@@ -1,8 +1,8 @@
 """
 Streamlit application for exploring U.S. House Statement of Disbursements (SOD) CSV files.
 
-The app scans the local ``SOD_Bulk`` folder, lets users choose which detail/summary files to
-load, exposes sidebar filters, and visualizes the filtered slice. Launch with:
+The app connects to a configured Google Cloud Storage bucket, lets users choose which detail/summary
+files to load, exposes sidebar filters, and visualizes the filtered slice. Launch with:
 
     streamlit run streamlit_app.py
 """
@@ -15,7 +15,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Set
-from zipfile import ZipFile
 
 import pandas as pd
 import streamlit as st
@@ -24,9 +23,6 @@ try:  # Optional dependency for GCS access.
     import gcsfs  # type: ignore
 except ImportError:  # pragma: no cover - handled in UI
     gcsfs = None
-
-# Default location that ships with the repository.
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "SOD_Bulk"
 
 # Limit for how many categorical options we surface as multiselects before
 # falling back to text queries to avoid rendering massive lists.
@@ -41,21 +37,21 @@ DEFAULT_GCS_PROFILE = {
 
 # Tokens that help infer reporting quarter from a file name.
 QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
-    ("JAN-MAR", ("Q1", "Jan–Mar")),
-    ("JANUARY-MARCH", ("Q1", "Jan–Mar")),
-    ("JAN_MAR", ("Q1", "Jan–Mar")),
-    ("APR-JUN", ("Q2", "Apr–Jun")),
-    ("APRIL-JUNE", ("Q2", "Apr–Jun")),
-    ("APR-JUNE", ("Q2", "Apr–Jun")),
-    ("APR_JUN", ("Q2", "Apr–Jun")),
-    ("JUL-SEP", ("Q3", "Jul–Sep")),
-    ("JUL-SEPT", ("Q3", "Jul–Sep")),
-    ("JULY-SEPT", ("Q3", "Jul–Sep")),
-    ("JULY-SEPTEMBER", ("Q3", "Jul–Sep")),
-    ("JUL-SEPTEMBER", ("Q3", "Jul–Sep")),
-    ("OCT-DEC", ("Q4", "Oct–Dec")),
-    ("OCTOBER-DECEMBER", ("Q4", "Oct–Dec")),
-    ("OCT-DECEMBER", ("Q4", "Oct–Dec")),
+    ("JAN-MAR", ("Q1", "Jan-Mar")),
+    ("JANUARY-MARCH", ("Q1", "Jan-Mar")),
+    ("JAN_MAR", ("Q1", "Jan-Mar")),
+    ("APR-JUN", ("Q2", "Apr-Jun")),
+    ("APRIL-JUNE", ("Q2", "Apr-Jun")),
+    ("APR-JUNE", ("Q2", "Apr-Jun")),
+    ("APR_JUN", ("Q2", "Apr-Jun")),
+    ("JUL-SEP", ("Q3", "Jul-Sep")),
+    ("JUL-SEPT", ("Q3", "Jul-Sep")),
+    ("JULY-SEPT", ("Q3", "Jul-Sep")),
+    ("JULY-SEPTEMBER", ("Q3", "Jul-Sep")),
+    ("JUL-SEPTEMBER", ("Q3", "Jul-Sep")),
+    ("OCT-DEC", ("Q4", "Oct-Dec")),
+    ("OCTOBER-DECEMBER", ("Q4", "Oct-Dec")),
+    ("OCT-DECEMBER", ("Q4", "Oct-Dec")),
 ]
 
 QUARTER_SORT_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
@@ -172,7 +168,7 @@ class FileMeta:
     def label(self) -> str:
         year_txt = str(self.year) if self.year else "Year ?"
         quarter_txt = self.quarter_label or "Quarter ?"
-        return f"{year_txt} {quarter_txt} • {self.data_type} • {self.filename}"
+        return f"{year_txt} {quarter_txt} | {self.data_type} | {self.filename}"
 
     @property
     def filename(self) -> str:
@@ -276,16 +272,6 @@ def _build_file_meta(csv_paths: Iterable[str]) -> List[FileMeta]:
             )
         )
     return sorted(files, key=lambda meta: meta.sort_key)
-
-
-@st.cache_data(show_spinner=False)
-def discover_local_files(data_dir_str: str) -> List[FileMeta]:
-    data_dir = Path(data_dir_str)
-    if not data_dir.exists():
-        return []
-
-    csv_paths = [str(path) for path in sorted(data_dir.glob("*.csv"))]
-    return _build_file_meta(csv_paths)
 
 
 @st.cache_resource(show_spinner=False)
@@ -942,116 +928,70 @@ def render_detail_download_sidebar(
         )
 
 
-def ensure_data_directory(path_str: str) -> Optional[Path]:
-    """Ensure a directory with CSVs exists, extracting from a zip if necessary."""
-
-    path = Path(path_str).expanduser()
-    if path.is_dir():
-        return path
-
-    candidates = []
-    if path.suffix.lower() == ".zip" and path.is_file():
-        candidates.append((path, path.parent / path.stem))
-    else:
-        zip_candidate = path.with_suffix(".zip")
-        if zip_candidate.is_file():
-            candidates.append((zip_candidate, path))
-
-    for zip_path, dest_dir in candidates:
-        try:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            with ZipFile(zip_path) as zf:
-                zf.extractall(dest_dir)
-            st.sidebar.success(f"Extracted {zip_path.name} into {dest_dir}")
-            return dest_dir
-        except Exception as exc:  # pragma: no cover - surface to the UI
-            st.sidebar.error(f"Failed to extract {zip_path.name}: {exc}")
-            return None
-
-    return path if path.is_dir() else None
-
-
 def main() -> None:
     st.set_page_config(page_title="SOD Explorer", layout="wide")
     st.title("Statement of Disbursements Explorer")
     st.caption("Interactively analyze SOD summary/detail CSV files with custom filters.")
 
-    data_source = st.sidebar.radio("", options=["Local folder", "GCS bucket"], index=1)
     files: List[FileMeta] = []
 
     storage_options: Optional[Dict[str, object]] = None
-    if data_source == "Local folder":
-        data_dir_input = st.sidebar.text_input(
-            "SOD data folder",
-            value=str(DEFAULT_DATA_DIR),
-            help="Path containing the raw CSV files.",
+    profile = get_preloaded_gcs_profile()
+    gcs_bucket = (profile.get("bucket") or "").strip()
+    gcs_prefix = (profile.get("prefix") or "").strip()
+    service_account_json = resolve_service_account_json(profile.get("service_account_json"))
+    storage_options = build_gcs_storage_options(service_account_json)
+
+    if not gcs_bucket:
+        st.error(
+            "No preloaded GCS bucket configured. Update DEFAULT_GCS_PROFILE or add an entry "
+            "under [gcs_sources] in Streamlit secrets."
         )
-        data_dir = ensure_data_directory(data_dir_input)
-        if not data_dir:
-            st.error("Unable to locate or extract the data directory. Check the path or zip file.")
-            st.stop()
-        files = discover_local_files(str(data_dir))
-    else:
-        profile = get_preloaded_gcs_profile()
-        gcs_bucket = (profile.get("bucket") or "").strip()
-        gcs_prefix = (profile.get("prefix") or "").strip()
-        service_account_json = resolve_service_account_json(profile.get("service_account_json"))
-        storage_options = build_gcs_storage_options(service_account_json)
+        st.stop()
 
-        if not gcs_bucket:
-            st.error(
-                "No preloaded GCS bucket configured. Update DEFAULT_GCS_PROFILE or add an entry "
-                "under [gcs_sources] in Streamlit secrets."
-            )
-            st.stop()
-
-
-        available_years, use_year_dirs = discover_gcs_years(
-            gcs_bucket, gcs_prefix, service_account_json
-        )
-        selected_year_filters: Tuple[int, ...] = ()
-        if available_years:
-            selected_year_filters = tuple(
-                st.sidebar.multiselect(
-                    "GCS reporting years",
-                    options=available_years,
-                    default=[],
-                    format_func=lambda year: str(year),
-                    help="Only the chosen years will be scanned within the bucket.",
-                )
-            )
-            if not selected_year_filters:
-                st.warning("Select at least one year to begin exploring the GCS data.")
-                st.stop()
-        else:
-            manual_text = st.sidebar.text_input(
+    available_years, use_year_dirs = discover_gcs_years(
+        gcs_bucket, gcs_prefix, service_account_json
+    )
+    selected_year_filters: Tuple[int, ...] = ()
+    if available_years:
+        selected_year_filters = tuple(
+            st.sidebar.multiselect(
                 "GCS reporting years",
-                placeholder="e.g. 2023, 2024",
-                help="Enter one or more four-digit years separated by commas or spaces.",
+                options=available_years,
+                default=[],
+                format_func=lambda year: str(year),
+                help="Only the chosen years will be scanned within the bucket.",
             )
-            manual_years = parse_year_tokens(manual_text)
-            if manual_years:
-                selected_year_filters = tuple(manual_years)
-            else:
-                st.warning(
-                    "Unable to auto-detect year folders. Provide at least one year above "
-                    "or configure a narrower prefix."
-                )
-                st.stop()
-
-        files = discover_gcs_files(
-            gcs_bucket,
-            gcs_prefix,
-            service_account_json,
-            years=selected_year_filters,
-            use_year_dirs=use_year_dirs,
         )
+        if not selected_year_filters:
+            st.warning("Select at least one year to begin exploring the GCS data.")
+            st.stop()
+    else:
+        manual_text = st.sidebar.text_input(
+            "GCS reporting years",
+            placeholder="e.g. 2023, 2024",
+            help="Enter one or more four-digit years separated by commas or spaces.",
+        )
+        manual_years = parse_year_tokens(manual_text)
+        if manual_years:
+            selected_year_filters = tuple(manual_years)
+        else:
+            st.warning(
+                "Unable to auto-detect year folders. Provide at least one year above "
+                "or configure a narrower prefix."
+            )
+            st.stop()
+
+    files = discover_gcs_files(
+        gcs_bucket,
+        gcs_prefix,
+        service_account_json,
+        years=selected_year_filters,
+        use_year_dirs=use_year_dirs,
+    )
 
     if not files:
-        if data_source == "Local folder":
-            st.error("No CSV files detected. Confirm the folder path and retry.")
-        else:
-            st.error("No CSV files detected in the specified bucket/prefix.")
+        st.error("No CSV files detected in the specified bucket/prefix.")
         st.stop()
 
     data_type, selected_files, selected_years = sidebar_dataset_picker(files)
@@ -1060,7 +1000,7 @@ def main() -> None:
         st.stop()
 
     selected_paths = tuple(str(meta.path) for meta in selected_files)
-    with st.spinner("Loading CSV files…"):
+    with st.spinner("Loading CSV files..."):
         df = load_data(selected_paths, data_type, storage_options=storage_options)
 
     if df.empty:
