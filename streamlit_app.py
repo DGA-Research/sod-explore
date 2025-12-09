@@ -64,6 +64,13 @@ PERSON_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 REMOTE_SCHEMES = ("gs://",)
+SUMMARY_GROUP_COLUMNS = (
+    "ORGANIZATION",
+    "PROGRAM",
+    "DESCRIPTION",
+    "BUDGET OBJECT CLASS",
+    "BUDGET OBJECT CODE",
+)
 
 
 def _is_remote_path(path_str: str) -> bool:
@@ -689,6 +696,72 @@ def _drop_total_rows(df: pd.DataFrame) -> pd.DataFrame:
     return filtered if not filtered.empty else df
 
 
+def _annotate_summary_period(df: pd.DataFrame) -> pd.DataFrame:
+    annotated = df.copy()
+    source_files = annotated.get("SOURCE_FILE")
+    if source_files is None:
+        annotated["_SOURCE_YEAR"] = None
+        annotated["_SOURCE_QUARTER"] = None
+        annotated["_SOURCE_QUARTER_ORDER"] = 0
+        return annotated
+
+    years: List[Optional[int]] = []
+    quarter_codes: List[Optional[str]] = []
+    quarter_orders: List[int] = []
+
+    for value in source_files:
+        file_name = str(value) if isinstance(value, (str, Path)) else ""
+        year = infer_year(file_name) if file_name else None
+        quarter_code, _ = infer_quarter_bits(file_name) if file_name else (None, None)
+        years.append(year)
+        quarter_codes.append(quarter_code)
+        quarter_orders.append(QUARTER_SORT_ORDER.get(quarter_code or "", 0))
+
+    annotated["_SOURCE_YEAR"] = years
+    annotated["_SOURCE_QUARTER"] = quarter_codes
+    annotated["_SOURCE_QUARTER_ORDER"] = quarter_orders
+    return annotated
+
+
+def _ytd_to_quarter_amounts(df: pd.DataFrame, amount_column: str) -> pd.Series:
+    if amount_column not in df.columns:
+        return pd.Series(dtype=float, index=df.index)
+
+    annotated = _annotate_summary_period(df)
+    group_cols = [col for col in SUMMARY_GROUP_COLUMNS if col in df.columns]
+    if "_SOURCE_YEAR" not in group_cols:
+        group_cols.append("_SOURCE_YEAR")
+    else:
+        # ensure year is last so we can sort consistently
+        group_cols = [col for col in group_cols if col != "_SOURCE_YEAR"] + ["_SOURCE_YEAR"]
+
+    if not group_cols:
+        group_cols = ["_SOURCE_YEAR"]
+
+    diffs = pd.Series(index=df.index, dtype=float)
+
+    sort_cols = group_cols + ["_SOURCE_QUARTER_ORDER", "SOURCE_FILE"]
+    annotated_order = annotated.sort_values(sort_cols)
+
+    for _, group in annotated_order.groupby(group_cols, dropna=False, sort=False):
+        idx = group.index
+        values = df.loc[idx, amount_column].astype(float)
+        delta = values.diff().fillna(values)
+        diffs.loc[idx] = delta
+
+    return diffs.reindex(df.index).fillna(0.0)
+
+
+def _prepare_summary_values(df: pd.DataFrame, amount_column: Optional[str]) -> pd.Series:
+    if not amount_column or amount_column not in df.columns:
+        return pd.Series(dtype=float, index=df.index)
+
+    values = df[amount_column].copy()
+    if amount_column.upper().startswith("YTD"):
+        return _ytd_to_quarter_amounts(df, amount_column)
+    return values
+
+
 def render_detail_view(df: pd.DataFrame) -> None:
     if df.empty:
         st.info("No detail records match the current filters.")
@@ -731,9 +804,14 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
         amount_column = df.columns[-1]
 
     analysis_df = _drop_total_rows(df)
+    value_series = _prepare_summary_values(analysis_df, amount_column)
+    analysis_df = analysis_df.assign(_VALUE=value_series)
+    if analysis_df["_VALUE"].empty:
+        st.info("Unable to compute summary values for the selected column.")
+        return
 
-    total_value = analysis_df[amount_column].sum()
-    avg_value = analysis_df[amount_column].mean()
+    total_value = analysis_df["_VALUE"].sum()
+    avg_value = analysis_df["_VALUE"].mean()
     unique_programs = analysis_df.get("PROGRAM", pd.Series(dtype=str)).nunique(dropna=True)
 
     c1, c2, c3 = st.columns(3)
@@ -743,17 +821,17 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     st.subheader("Top descriptions")
     top_desc = (
-        analysis_df.groupby("DESCRIPTION")[amount_column]
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-            .rename("Total")
+        analysis_df.groupby("DESCRIPTION")["_VALUE"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(10)
+        .rename("Total")
     )
     st.dataframe(top_desc)
 
     st.subheader("Organizations by value")
     org_chart = (
-        analysis_df.groupby("ORGANIZATION")[amount_column]
+        analysis_df.groupby("ORGANIZATION")["_VALUE"]
         .sum()
         .sort_values(ascending=False)
         .head(10)
