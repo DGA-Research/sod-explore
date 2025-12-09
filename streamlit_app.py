@@ -692,6 +692,17 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, object], data_type: str) 
     return filtered
 
 
+def _drop_total_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove Statement rollup rows (e.g., 'OFFICE TOTALS') to avoid double counting."""
+
+    if "DESCRIPTION" not in df.columns:
+        return df
+
+    mask = ~df["DESCRIPTION"].str.contains(r"TOTALS?:?$", case=False, na=False)
+    filtered = df[mask]
+    return filtered if not filtered.empty else df
+
+
 def render_detail_view(df: pd.DataFrame) -> None:
     if df.empty:
         st.info("No detail records match the current filters.")
@@ -733,9 +744,11 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
     if amount_column not in df.columns:
         amount_column = df.columns[-1]
 
-    total_value = df[amount_column].sum()
-    avg_value = df[amount_column].mean()
-    unique_programs = df.get("PROGRAM", pd.Series(dtype=str)).nunique(dropna=True)
+    analysis_df = _drop_total_rows(df)
+
+    total_value = analysis_df[amount_column].sum()
+    avg_value = analysis_df[amount_column].mean()
+    unique_programs = analysis_df.get("PROGRAM", pd.Series(dtype=str)).nunique(dropna=True)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Aggregate value", f"${total_value:,.0f}")
@@ -744,7 +757,7 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     st.subheader("Top descriptions")
     top_desc = (
-        df.groupby("DESCRIPTION")[amount_column]
+        analysis_df.groupby("DESCRIPTION")[amount_column]
             .sum()
             .sort_values(ascending=False)
             .head(10)
@@ -754,7 +767,7 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     st.subheader("Organizations by value")
     org_chart = (
-        df.groupby("ORGANIZATION")[amount_column]
+        analysis_df.groupby("ORGANIZATION")[amount_column]
         .sum()
         .sort_values(ascending=False)
         .head(10)
