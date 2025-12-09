@@ -119,6 +119,16 @@ def resolve_service_account_json(explicit_json: Optional[str]) -> Optional[str]:
     return _serialize_secret_mapping(secret_account)
 
 
+def build_gcs_storage_options(service_account_json: Optional[str]) -> Optional[Dict[str, object]]:
+    if not service_account_json:
+        return None
+    try:
+        token_obj = json.loads(service_account_json)
+    except json.JSONDecodeError:
+        token_obj = service_account_json
+    return {"token": token_obj}
+
+
 def get_configured_gcs_sources() -> Dict[str, Dict[str, str]]:
     sources = _get_secret_dict("gcs_sources")
     normalized: Dict[str, Dict[str, str]] = {}
@@ -387,7 +397,9 @@ def _to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
-def _read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
+def _read_csv_with_fallback(
+    csv_path: Path, storage_options: Optional[Dict[str, object]] = None
+) -> pd.DataFrame:
     """Attempt to read a CSV trying multiple encodings commonly used in SOD files."""
 
     encodings = ("utf-8", "cp1252", "latin-1")
@@ -395,7 +407,13 @@ def _read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
     read_kwargs = {"low_memory": False}
     for encoding in encodings:
         try:
-            return pd.read_csv(csv_path, encoding=encoding, encoding_errors="ignore", **read_kwargs)
+            return pd.read_csv(
+                csv_path,
+                encoding=encoding,
+                encoding_errors="ignore",
+                storage_options=storage_options,
+                **read_kwargs,
+            )
         except UnicodeDecodeError as exc:
             last_error = exc
             continue
@@ -452,7 +470,11 @@ def extract_person_name(value: object) -> Optional[str]:
 
 
 @st.cache_data(show_spinner=True)
-def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
+def load_data(
+    file_paths: Tuple[str, ...],
+    data_type: str,
+    storage_options: Optional[Dict[str, object]] = None,
+) -> pd.DataFrame:
     if not file_paths:
         return pd.DataFrame()
 
@@ -460,7 +482,7 @@ def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
     for path_str in file_paths:
         if not _path_exists(path_str):
             continue
-        df = _read_csv_with_fallback(path_str)
+        df = _read_csv_with_fallback(path_str, storage_options=storage_options)
         df.columns = [col.strip().upper() for col in df.columns]
         df["SOURCE_FILE"] = _extract_filename(path_str)
         if "ORGANIZATION" in df.columns and "PERSON" not in df.columns:
@@ -735,7 +757,11 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
 
 def render_data_preview(
-    df: pd.DataFrame, data_type: str, selected_paths: Tuple[str, ...], filters: Dict[str, object]
+    df: pd.DataFrame,
+    data_type: str,
+    selected_paths: Tuple[str, ...],
+    filters: Dict[str, object],
+    storage_options: Optional[Dict[str, object]] = None,
 ) -> None:
     st.subheader("Filtered rows")
     st.caption(f"{len(df):,} rows displayed (showing first 1,000).")
@@ -747,7 +773,11 @@ def render_data_preview(
             detail_filters = dict(filters)
             detail_filters["amount_column"] = "AMOUNT"
             try:
-                csv_bytes = stream_filtered_detail_csv(list(selected_paths), detail_filters)
+                csv_bytes = stream_filtered_detail_csv(
+                    list(selected_paths),
+                    detail_filters,
+                    storage_options=storage_options,
+                )
             except ValueError as exc:
                 st.info(str(exc))
                 return
@@ -770,7 +800,10 @@ def render_data_preview(
 
 
 def stream_filtered_detail_csv(
-    csv_paths: List[str], filters: Dict[str, object], chunk_size: int = 100_000
+    csv_paths: List[str],
+    filters: Dict[str, object],
+    chunk_size: int = 100_000,
+    storage_options: Optional[Dict[str, object]] = None,
 ) -> bytes:
     """Read detail CSVs in chunks, apply filters, and return the concatenated CSV bytes."""
 
@@ -782,7 +815,9 @@ def stream_filtered_detail_csv(
         if not _path_exists(path_str):
             continue
 
-        for chunk in _iter_csv_chunks(path_str, chunk_size):
+        for chunk in _iter_csv_chunks(
+            path_str, chunk_size, storage_options=storage_options
+        ):
             chunk.columns = [col.strip().upper() for col in chunk.columns]
             chunk["SOURCE_FILE"] = _extract_filename(path_str)
 
@@ -813,7 +848,11 @@ def stream_filtered_detail_csv(
     return output_buffer.getvalue().encode("utf-8")
 
 
-def _iter_csv_chunks(csv_path: str, chunk_size: int) -> Iterable[pd.DataFrame]:
+def _iter_csv_chunks(
+    csv_path: str,
+    chunk_size: int,
+    storage_options: Optional[Dict[str, object]] = None,
+) -> Iterable[pd.DataFrame]:
     """Yield DataFrame chunks using the same encoding fallback as bulk loading."""
 
     encodings = ("utf-8", "cp1252", "latin-1")
@@ -826,6 +865,7 @@ def _iter_csv_chunks(csv_path: str, chunk_size: int) -> Iterable[pd.DataFrame]:
                 encoding_errors="ignore",
                 low_memory=False,
                 chunksize=chunk_size,
+                storage_options=storage_options,
             )
             for chunk in chunk_iter:
                 yield chunk
@@ -840,7 +880,10 @@ def _iter_csv_chunks(csv_path: str, chunk_size: int) -> Iterable[pd.DataFrame]:
 
 
 def render_detail_download_sidebar(
-    all_files: List[FileMeta], selected_years: List[Optional[int]], filters: Dict[str, object]
+    all_files: List[FileMeta],
+    selected_years: List[Optional[int]],
+    filters: Dict[str, object],
+    storage_options: Optional[Dict[str, object]] = None,
 ) -> None:
     expander = st.sidebar.expander("Detailed summary download", expanded=False)
     with expander:
@@ -864,7 +907,9 @@ def render_detail_download_sidebar(
         detail_filters["amount_column"] = "AMOUNT"
 
         try:
-            csv_bytes = stream_filtered_detail_csv(detail_paths, detail_filters)
+            csv_bytes = stream_filtered_detail_csv(
+                detail_paths, detail_filters, storage_options=storage_options
+            )
         except ValueError as exc:
             st.info(str(exc))
             return
@@ -915,6 +960,7 @@ def main() -> None:
     data_source = st.sidebar.radio("Data source", options=["Local folder", "GCS bucket"], index=0)
     files: List[FileMeta] = []
 
+    storage_options: Optional[Dict[str, object]] = None
     if data_source == "Local folder":
         data_dir_input = st.sidebar.text_input(
             "SOD data folder",
@@ -931,6 +977,7 @@ def main() -> None:
         gcs_bucket = (profile.get("bucket") or "").strip()
         gcs_prefix = (profile.get("prefix") or "").strip()
         service_account_json = resolve_service_account_json(profile.get("service_account_json"))
+        storage_options = build_gcs_storage_options(service_account_json)
 
         if not gcs_bucket:
             st.error(
@@ -1002,7 +1049,7 @@ def main() -> None:
 
     selected_paths = tuple(str(meta.path) for meta in selected_files)
     with st.spinner("Loading CSV files…"):
-        df = load_data(selected_paths, data_type)
+        df = load_data(selected_paths, data_type, storage_options=storage_options)
 
     if df.empty:
         st.error("The selected files could not be loaded or contain no rows.")
@@ -1017,8 +1064,16 @@ def main() -> None:
     else:
         render_summary_view(filtered_df, amount_column)
 
-    render_data_preview(filtered_df, data_type, selected_paths, filters)
-    render_detail_download_sidebar(files, selected_years, filters)
+    render_data_preview(
+        filtered_df,
+        data_type,
+        selected_paths,
+        filters,
+        storage_options=storage_options,
+    )
+    render_detail_download_sidebar(
+        files, selected_years, filters, storage_options=storage_options
+    )
 
 
 if __name__ == "__main__":
