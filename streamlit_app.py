@@ -14,7 +14,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Set
 from zipfile import ZipFile
 
 import pandas as pd
@@ -31,6 +31,13 @@ DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "SOD_Bulk"
 # Limit for how many categorical options we surface as multiselects before
 # falling back to text queries to avoid rendering massive lists.
 SIDEBAR_OPTION_LIMIT = 500
+
+# Default remote profile used when no secrets-based entry exists.
+DEFAULT_GCS_PROFILE = {
+    "bucket": "sod-files",
+    "prefix": "",  # or e.g. "detail/" if you keep data in a subfolder
+    "service_account_json": None,
+}
 
 # Tokens that help infer reporting quarter from a file name.
 QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
@@ -52,6 +59,9 @@ QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
 ]
 
 QUARTER_SORT_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+YEAR_FILENAME_OVERRIDES = {
+    "JULY-SEPTEMBER-SOD-SUMMARY-GRID-FINAL.CSV": 2023,
+}
 DATE_FORMATS = ("%d-%b-%y", "%d-%b-%Y", "%m/%d/%Y")
 PERSON_PREFIX_PATTERN = re.compile(
     r"^(THE\s+HONORABLE|THE\s+HON\.|HONORABLE|HON\.?|REPRESENTATIVE|REP\.?|SENATOR|SEN\.?|DELEGATE|DEL\.?|RESIDENT\s+COMMISSIONER)\s+",
@@ -76,6 +86,76 @@ def _path_exists(path_str: str) -> bool:
     if _is_remote_path(path_str):
         return True
     return Path(path_str).exists()
+
+
+def _get_secret_dict(key: str) -> Dict[str, Dict[str, object]]:
+    try:
+        value = st.secrets.get(key)  # type: ignore[attr-defined]
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _serialize_secret_mapping(secret_obj: object) -> Optional[str]:
+    if secret_obj is None:
+        return None
+    if isinstance(secret_obj, str):
+        return secret_obj.strip() or None
+    if hasattr(secret_obj, "to_dict"):
+        secret_obj = secret_obj.to_dict()  # type: ignore[attr-defined]
+    if isinstance(secret_obj, dict):
+        return json.dumps(secret_obj)
+    try:
+        return json.dumps(secret_obj)
+    except TypeError:
+        return None
+
+
+def resolve_service_account_json(explicit_json: Optional[str]) -> Optional[str]:
+    explicit = (explicit_json or "").strip()
+    if explicit:
+        return explicit
+    try:
+        secret_account = st.secrets.get("gcp_service_account")  # type: ignore[attr-defined]
+    except Exception:
+        secret_account = None
+    return _serialize_secret_mapping(secret_account)
+
+
+def build_gcs_storage_options(service_account_json: Optional[str]) -> Optional[Dict[str, object]]:
+    if not service_account_json:
+        return None
+    try:
+        token_obj = json.loads(service_account_json)
+    except json.JSONDecodeError:
+        token_obj = service_account_json
+    return {"token": token_obj}
+
+
+def get_configured_gcs_sources() -> Dict[str, Dict[str, str]]:
+    sources = _get_secret_dict("gcs_sources")
+    normalized: Dict[str, Dict[str, str]] = {}
+    for name, config in sources.items():
+        if not isinstance(config, dict):
+            continue
+        bucket = str(config.get("bucket", "")).strip()
+        if not bucket:
+            continue
+        sa_value = config.get("service_account_json", "")
+        normalized[name] = {
+            "bucket": bucket,
+            "prefix": str(config.get("prefix", "") or "").strip(),
+            "service_account_json": (_serialize_secret_mapping(sa_value) or "").strip(),
+        }
+    return normalized
+
+
+def get_preloaded_gcs_profile() -> Dict[str, Optional[str]]:
+    configured = get_configured_gcs_sources()
+    if configured:
+        first_key = sorted(configured.keys())[0]
+        return configured[first_key]
+    return DEFAULT_GCS_PROFILE
 
 
 @dataclass
@@ -125,10 +205,37 @@ def infer_data_type(name: str) -> str:
 
 
 def infer_year(name: str) -> Optional[int]:
+    normalized_name = normalize_name(name)
+    if normalized_name in YEAR_FILENAME_OVERRIDES:
+        return YEAR_FILENAME_OVERRIDES[normalized_name]
     match = re.search(r"(20\d{2}|19\d{2})", name)
     if match:
         return int(match.group(1))
     return None
+
+
+def parse_year_tokens(text: str) -> List[int]:
+    tokens = re.split(r"[,\s]+", text.strip())
+    years: Set[int] = set()
+    for token in tokens:
+        if not token:
+            continue
+        if re.fullmatch(r"\d{4}", token):
+            years.add(int(token))
+    return sorted(years)
+
+
+def filter_paths_by_year(paths: Iterable[str], years: Tuple[int, ...]) -> List[str]:
+    targets = set(years)
+    filtered: List[str] = []
+    for path_str in paths:
+        filename = _extract_filename(path_str)
+        inferred = infer_year(filename)
+        if inferred is None:
+            continue
+        if inferred in targets:
+            filtered.append(path_str)
+    return filtered
 
 
 def infer_year_from_file(csv_path: Path) -> Optional[int]:
@@ -191,8 +298,55 @@ def _get_gcs_filesystem(service_account_json: Optional[str]):
 
 
 @st.cache_data(show_spinner=True)
-def discover_gcs_files(
+def discover_gcs_years(
     bucket: str, prefix: str, service_account_json: Optional[str]
+) -> Tuple[List[int], bool]:
+    bucket = bucket.strip()
+    if bucket.startswith("gs://"):
+        bucket = bucket[5:]
+    if not bucket:
+        return [], False
+
+    prefix = prefix.strip().lstrip("/")
+    search_root = f"{bucket}/{prefix}" if prefix else bucket
+
+    try:
+        fs = _get_gcs_filesystem(service_account_json)
+    except Exception as exc:  # pragma: no cover - surfaced via UI
+        st.sidebar.error(f"GCS authentication failed while listing years: {exc}")
+        return [], False
+
+    try:
+        entries = fs.ls(search_root, detail=False)
+    except FileNotFoundError:
+        st.sidebar.error(f"GCS path not found: {search_root}")
+        return [], False
+    except Exception as exc:  # pragma: no cover
+        st.sidebar.error(f"Failed to inspect gs://{search_root}: {exc}")
+        return [], False
+
+    years: Set[int] = set()
+    dir_years: Set[int] = set()
+    for entry in entries:
+        normalized = entry.rstrip("/")
+        name = normalized.split("/")[-1]
+        inferred = infer_year(name)
+        if inferred is not None:
+            years.add(inferred)
+        if entry.endswith("/") and re.fullmatch(r"\d{4}", name):
+            dir_years.add(int(name))
+
+    use_year_dirs = len(dir_years) > 0
+    return sorted(years), use_year_dirs
+
+
+@st.cache_data(show_spinner=True)
+def discover_gcs_files(
+    bucket: str,
+    prefix: str,
+    service_account_json: Optional[str],
+    years: Optional[Tuple[int, ...]] = None,
+    use_year_dirs: bool = False,
 ) -> List[FileMeta]:
     bucket = bucket.strip()
     if bucket.startswith("gs://"):
@@ -209,16 +363,37 @@ def discover_gcs_files(
         st.sidebar.error(f"GCS authentication failed: {exc}")
         return []
 
-    try:
-        objects = fs.find(search_root)
-    except FileNotFoundError:
-        st.sidebar.error(f"Bucket or prefix not found: {search_root}")
-        return []
-    except Exception as exc:  # pragma: no cover
-        st.sidebar.error(f"Failed to list gs://{search_root}: {exc}")
-        return []
+    year_filters: Tuple[int, ...] = tuple(sorted(set(years))) if years else ()
 
-    csv_paths = sorted(f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv"))
+    csv_paths: List[str] = []
+    if year_filters and use_year_dirs:
+        normalized_root = search_root.rstrip("/")
+        search_roots = [f"{normalized_root}/{year}".lstrip("/") for year in year_filters]
+        for root in search_roots:
+            try:
+                objects = fs.find(root)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:  # pragma: no cover
+                st.sidebar.error(f"Failed to list gs://{root}: {exc}")
+                continue
+            csv_paths.extend(f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv"))
+        if not csv_paths and year_filters:
+            st.sidebar.info("Falling back to prefix-wide scan; year folders not found.")
+    if not csv_paths:
+        try:
+            objects = fs.find(search_root)
+        except FileNotFoundError:
+            return []
+        except Exception as exc:  # pragma: no cover
+            st.sidebar.error(f"Failed to list gs://{search_root}: {exc}")
+            return []
+        csv_paths = [f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv")]
+
+    if year_filters:
+        csv_paths = filter_paths_by_year(csv_paths, year_filters)
+
+    csv_paths = sorted(csv_paths)
     if not csv_paths:
         return []
     return _build_file_meta(csv_paths)
@@ -228,7 +403,9 @@ def _to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
-def _read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
+def _read_csv_with_fallback(
+    csv_path: Path, storage_options: Optional[Dict[str, object]] = None
+) -> pd.DataFrame:
     """Attempt to read a CSV trying multiple encodings commonly used in SOD files."""
 
     encodings = ("utf-8", "cp1252", "latin-1")
@@ -236,7 +413,13 @@ def _read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
     read_kwargs = {"low_memory": False}
     for encoding in encodings:
         try:
-            return pd.read_csv(csv_path, encoding=encoding, encoding_errors="ignore", **read_kwargs)
+            return pd.read_csv(
+                csv_path,
+                encoding=encoding,
+                encoding_errors="ignore",
+                storage_options=storage_options,
+                **read_kwargs,
+            )
         except UnicodeDecodeError as exc:
             last_error = exc
             continue
@@ -293,7 +476,11 @@ def extract_person_name(value: object) -> Optional[str]:
 
 
 @st.cache_data(show_spinner=True)
-def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
+def load_data(
+    file_paths: Tuple[str, ...],
+    data_type: str,
+    storage_options: Optional[Dict[str, object]] = None,
+) -> pd.DataFrame:
     if not file_paths:
         return pd.DataFrame()
 
@@ -301,7 +488,7 @@ def load_data(file_paths: Tuple[str, ...], data_type: str) -> pd.DataFrame:
     for path_str in file_paths:
         if not _path_exists(path_str):
             continue
-        df = _read_csv_with_fallback(path_str)
+        df = _read_csv_with_fallback(path_str, storage_options=storage_options)
         df.columns = [col.strip().upper() for col in df.columns]
         df["SOURCE_FILE"] = _extract_filename(path_str)
         if "ORGANIZATION" in df.columns and "PERSON" not in df.columns:
@@ -505,6 +692,17 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, object], data_type: str) 
     return filtered
 
 
+def _drop_total_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove Statement rollup rows (e.g., 'OFFICE TOTALS') to avoid double counting."""
+
+    if "DESCRIPTION" not in df.columns:
+        return df
+
+    mask = ~df["DESCRIPTION"].str.contains(r"TOTALS?:?$", case=False, na=False)
+    filtered = df[mask]
+    return filtered if not filtered.empty else df
+
+
 def render_detail_view(df: pd.DataFrame) -> None:
     if df.empty:
         st.info("No detail records match the current filters.")
@@ -546,9 +744,11 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
     if amount_column not in df.columns:
         amount_column = df.columns[-1]
 
-    total_value = df[amount_column].sum()
-    avg_value = df[amount_column].mean()
-    unique_programs = df.get("PROGRAM", pd.Series(dtype=str)).nunique(dropna=True)
+    analysis_df = _drop_total_rows(df)
+
+    total_value = analysis_df[amount_column].sum()
+    avg_value = analysis_df[amount_column].mean()
+    unique_programs = analysis_df.get("PROGRAM", pd.Series(dtype=str)).nunique(dropna=True)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Aggregate value", f"${total_value:,.0f}")
@@ -557,7 +757,7 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     st.subheader("Top descriptions")
     top_desc = (
-        df.groupby("DESCRIPTION")[amount_column]
+        analysis_df.groupby("DESCRIPTION")[amount_column]
             .sum()
             .sort_values(ascending=False)
             .head(10)
@@ -567,7 +767,7 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     st.subheader("Organizations by value")
     org_chart = (
-        df.groupby("ORGANIZATION")[amount_column]
+        analysis_df.groupby("ORGANIZATION")[amount_column]
         .sum()
         .sort_values(ascending=False)
         .head(10)
@@ -576,7 +776,11 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
 
 def render_data_preview(
-    df: pd.DataFrame, data_type: str, selected_paths: Tuple[str, ...], filters: Dict[str, object]
+    df: pd.DataFrame,
+    data_type: str,
+    selected_paths: Tuple[str, ...],
+    filters: Dict[str, object],
+    storage_options: Optional[Dict[str, object]] = None,
 ) -> None:
     st.subheader("Filtered rows")
     st.caption(f"{len(df):,} rows displayed (showing first 1,000).")
@@ -588,7 +792,11 @@ def render_data_preview(
             detail_filters = dict(filters)
             detail_filters["amount_column"] = "AMOUNT"
             try:
-                csv_bytes = stream_filtered_detail_csv(list(selected_paths), detail_filters)
+                csv_bytes = stream_filtered_detail_csv(
+                    list(selected_paths),
+                    detail_filters,
+                    storage_options=storage_options,
+                )
             except ValueError as exc:
                 st.info(str(exc))
                 return
@@ -611,7 +819,10 @@ def render_data_preview(
 
 
 def stream_filtered_detail_csv(
-    csv_paths: List[str], filters: Dict[str, object], chunk_size: int = 100_000
+    csv_paths: List[str],
+    filters: Dict[str, object],
+    chunk_size: int = 100_000,
+    storage_options: Optional[Dict[str, object]] = None,
 ) -> bytes:
     """Read detail CSVs in chunks, apply filters, and return the concatenated CSV bytes."""
 
@@ -623,7 +834,9 @@ def stream_filtered_detail_csv(
         if not _path_exists(path_str):
             continue
 
-        for chunk in _iter_csv_chunks(path_str, chunk_size):
+        for chunk in _iter_csv_chunks(
+            path_str, chunk_size, storage_options=storage_options
+        ):
             chunk.columns = [col.strip().upper() for col in chunk.columns]
             chunk["SOURCE_FILE"] = _extract_filename(path_str)
 
@@ -654,7 +867,11 @@ def stream_filtered_detail_csv(
     return output_buffer.getvalue().encode("utf-8")
 
 
-def _iter_csv_chunks(csv_path: str, chunk_size: int) -> Iterable[pd.DataFrame]:
+def _iter_csv_chunks(
+    csv_path: str,
+    chunk_size: int,
+    storage_options: Optional[Dict[str, object]] = None,
+) -> Iterable[pd.DataFrame]:
     """Yield DataFrame chunks using the same encoding fallback as bulk loading."""
 
     encodings = ("utf-8", "cp1252", "latin-1")
@@ -667,6 +884,7 @@ def _iter_csv_chunks(csv_path: str, chunk_size: int) -> Iterable[pd.DataFrame]:
                 encoding_errors="ignore",
                 low_memory=False,
                 chunksize=chunk_size,
+                storage_options=storage_options,
             )
             for chunk in chunk_iter:
                 yield chunk
@@ -681,7 +899,10 @@ def _iter_csv_chunks(csv_path: str, chunk_size: int) -> Iterable[pd.DataFrame]:
 
 
 def render_detail_download_sidebar(
-    all_files: List[FileMeta], selected_years: List[Optional[int]], filters: Dict[str, object]
+    all_files: List[FileMeta],
+    selected_years: List[Optional[int]],
+    filters: Dict[str, object],
+    storage_options: Optional[Dict[str, object]] = None,
 ) -> None:
     expander = st.sidebar.expander("Detailed summary download", expanded=False)
     with expander:
@@ -705,7 +926,9 @@ def render_detail_download_sidebar(
         detail_filters["amount_column"] = "AMOUNT"
 
         try:
-            csv_bytes = stream_filtered_detail_csv(detail_paths, detail_filters)
+            csv_bytes = stream_filtered_detail_csv(
+                detail_paths, detail_filters, storage_options=storage_options
+            )
         except ValueError as exc:
             st.info(str(exc))
             return
@@ -753,9 +976,10 @@ def main() -> None:
     st.title("Statement of Disbursements Explorer")
     st.caption("Interactively analyze SOD summary/detail CSV files with custom filters.")
 
-    data_source = st.sidebar.radio("Data source", options=["Local folder", "GCS bucket"], index=0)
+    data_source = st.sidebar.radio("Data source", options=["Local folder", "GCS bucket"], index=1)
     files: List[FileMeta] = []
 
+    storage_options: Optional[Dict[str, object]] = None
     if data_source == "Local folder":
         data_dir_input = st.sidebar.text_input(
             "SOD data folder",
@@ -768,27 +992,66 @@ def main() -> None:
             st.stop()
         files = discover_local_files(str(data_dir))
     else:
-        gcs_bucket = st.sidebar.text_input("GCS bucket", value="", help="Example: my-bucket-name")
-        gcs_prefix = st.sidebar.text_input(
-            "Object prefix (optional)",
-            value="",
-            help="Example: sod/detail/2024_Q1/",
+        profile = get_preloaded_gcs_profile()
+        gcs_bucket = (profile.get("bucket") or "").strip()
+        gcs_prefix = (profile.get("prefix") or "").strip()
+        service_account_json = resolve_service_account_json(profile.get("service_account_json"))
+        storage_options = build_gcs_storage_options(service_account_json)
+
+        if not gcs_bucket:
+            st.error(
+                "No preloaded GCS bucket configured. Update DEFAULT_GCS_PROFILE or add an entry "
+                "under [gcs_sources] in Streamlit secrets."
+            )
+            st.stop()
+
+        prefix_label = gcs_prefix or "(entire bucket)"
+        st.sidebar.success(f"Using GCS bucket: {gcs_bucket}\nPrefix: {prefix_label}")
+        if service_account_json:
+            st.sidebar.caption("Service account credentials loaded automatically.")
+        else:
+            st.sidebar.warning("No service account JSON detected; relying on default credentials.")
+
+        available_years, use_year_dirs = discover_gcs_years(
+            gcs_bucket, gcs_prefix, service_account_json
         )
-        service_account_input = st.sidebar.text_area(
-            "Service account JSON (optional)",
-            value="",
-            height=120,
-            help="Leave blank to use Application Default Credentials or a gcp_service_account secret.",
+        selected_year_filters: Tuple[int, ...] = ()
+        if available_years:
+            selected_year_filters = tuple(
+                st.sidebar.multiselect(
+                    "GCS reporting years",
+                    options=available_years,
+                    default=[],
+                    format_func=lambda year: str(year),
+                    help="Only the chosen years will be scanned within the bucket.",
+                )
+            )
+            if not selected_year_filters:
+                st.warning("Select at least one year to begin exploring the GCS data.")
+                st.stop()
+        else:
+            manual_text = st.sidebar.text_input(
+                "GCS reporting years",
+                placeholder="e.g. 2023, 2024",
+                help="Enter one or more four-digit years separated by commas or spaces.",
+            )
+            manual_years = parse_year_tokens(manual_text)
+            if manual_years:
+                selected_year_filters = tuple(manual_years)
+            else:
+                st.warning(
+                    "Unable to auto-detect year folders. Provide at least one year above "
+                    "or configure a narrower prefix."
+                )
+                st.stop()
+
+        files = discover_gcs_files(
+            gcs_bucket,
+            gcs_prefix,
+            service_account_json,
+            years=selected_year_filters,
+            use_year_dirs=use_year_dirs,
         )
-        service_account_json = service_account_input.strip() or None
-        try:
-            secret_account = st.secrets.get("gcp_service_account")  # type: ignore[attr-defined]
-        except Exception:  # pragma: no cover - secrets unavailable locally
-            secret_account = None
-        if not service_account_json and secret_account:
-            service_account_json = json.dumps(secret_account)
-            st.sidebar.caption("Using gcp_service_account from Streamlit secrets.")
-        files = discover_gcs_files(gcs_bucket, gcs_prefix, service_account_json)
 
     if not files:
         if data_source == "Local folder":
@@ -804,7 +1067,7 @@ def main() -> None:
 
     selected_paths = tuple(str(meta.path) for meta in selected_files)
     with st.spinner("Loading CSV files…"):
-        df = load_data(selected_paths, data_type)
+        df = load_data(selected_paths, data_type, storage_options=storage_options)
 
     if df.empty:
         st.error("The selected files could not be loaded or contain no rows.")
@@ -819,8 +1082,16 @@ def main() -> None:
     else:
         render_summary_view(filtered_df, amount_column)
 
-    render_data_preview(filtered_df, data_type, selected_paths, filters)
-    render_detail_download_sidebar(files, selected_years, filters)
+    render_data_preview(
+        filtered_df,
+        data_type,
+        selected_paths,
+        filters,
+        storage_options=storage_options,
+    )
+    render_detail_download_sidebar(
+        files, selected_years, filters, storage_options=storage_options
+    )
 
 
 if __name__ == "__main__":
