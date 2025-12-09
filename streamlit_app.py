@@ -976,7 +976,7 @@ def main() -> None:
     st.title("Statement of Disbursements Explorer")
     st.caption("Interactively analyze SOD summary/detail CSV files with custom filters.")
 
-    data_source = st.sidebar.radio("Data source", options=["Local folder", "GCS bucket"], index=1)
+    data_source = st.sidebar.radio("", options=["Local folder", "GCS bucket"], index=1)
     files: List[FileMeta] = []
 
     storage_options: Optional[Dict[str, object]] = None
@@ -1005,12 +1005,6 @@ def main() -> None:
             )
             st.stop()
 
-        prefix_label = gcs_prefix or "(entire bucket)"
-        st.sidebar.success(f"Using GCS bucket: {gcs_bucket}\nPrefix: {prefix_label}")
-        if service_account_json:
-            st.sidebar.caption("Service account credentials loaded automatically.")
-        else:
-            st.sidebar.warning("No service account JSON detected; relying on default credentials.")
 
         available_years, use_year_dirs = discover_gcs_years(
             gcs_bucket, gcs_prefix, service_account_json
