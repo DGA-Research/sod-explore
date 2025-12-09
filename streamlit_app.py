@@ -209,6 +209,19 @@ def parse_year_tokens(text: str) -> List[int]:
     return sorted(years)
 
 
+def filter_paths_by_year(paths: Iterable[str], years: Tuple[int, ...]) -> List[str]:
+    targets = set(years)
+    filtered: List[str] = []
+    for path_str in paths:
+        filename = _extract_filename(path_str)
+        inferred = infer_year(filename)
+        if inferred is None:
+            continue
+        if inferred in targets:
+            filtered.append(path_str)
+    return filtered
+
+
 def infer_year_from_file(csv_path: Path) -> Optional[int]:
     """Fallback: peek inside the CSV and capture the first year token."""
 
@@ -329,11 +342,10 @@ def discover_gcs_files(
         return []
 
     search_roots = [search_root]
-    if years:
+    year_filters: Tuple[int, ...] = tuple(sorted(set(years))) if years else ()
+    if year_filters:
         normalized_root = search_root.rstrip("/")
-        search_roots = [
-            f"{normalized_root}/{year}".lstrip("/") for year in sorted(set(years))
-        ]
+        search_roots = [f"{normalized_root}/{year}".lstrip("/") for year in year_filters]
 
     csv_paths: List[str] = []
     for root in search_roots:
@@ -346,13 +358,24 @@ def discover_gcs_files(
             continue
         csv_paths.extend(f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv"))
 
+    if not csv_paths and year_filters:
+        st.sidebar.warning(
+            "Year-specific folders not found; searching the entire prefix instead."
+        )
+        try:
+            objects = fs.find(search_root)
+        except Exception as exc:  # pragma: no cover
+            st.sidebar.error(f"Failed to list gs://{search_root}: {exc}")
+            return []
+        csv_paths = [
+            f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv")
+        ]
+
+    if year_filters and csv_paths:
+        csv_paths = filter_paths_by_year(csv_paths, year_filters)
+
     csv_paths = sorted(csv_paths)
     if not csv_paths:
-        if years:
-            st.sidebar.warning(
-                "No files matched the selected year folders; scanning the entire prefix (may be slower)."
-            )
-            return discover_gcs_files(bucket, prefix, service_account_json, years=None)
         return []
     return _build_file_meta(csv_paths)
 
