@@ -14,7 +14,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Set
 from zipfile import ZipFile
 
 import pandas as pd
@@ -198,6 +198,17 @@ def infer_year(name: str) -> Optional[int]:
     return None
 
 
+def parse_year_tokens(text: str) -> List[int]:
+    tokens = re.split(r"[,\s]+", text.strip())
+    years: Set[int] = set()
+    for token in tokens:
+        if not token:
+            continue
+        if re.fullmatch(r"\d{4}", token):
+            years.add(int(token))
+    return sorted(years)
+
+
 def infer_year_from_file(csv_path: Path) -> Optional[int]:
     """Fallback: peek inside the CSV and capture the first year token."""
 
@@ -258,8 +269,49 @@ def _get_gcs_filesystem(service_account_json: Optional[str]):
 
 
 @st.cache_data(show_spinner=True)
-def discover_gcs_files(
+def discover_gcs_years(
     bucket: str, prefix: str, service_account_json: Optional[str]
+) -> List[int]:
+    bucket = bucket.strip()
+    if bucket.startswith("gs://"):
+        bucket = bucket[5:]
+    if not bucket:
+        return []
+
+    prefix = prefix.strip().lstrip("/")
+    search_root = f"{bucket}/{prefix}" if prefix else bucket
+
+    try:
+        fs = _get_gcs_filesystem(service_account_json)
+    except Exception as exc:  # pragma: no cover - surfaced via UI
+        st.sidebar.error(f"GCS authentication failed while listing years: {exc}")
+        return []
+
+    try:
+        entries = fs.ls(search_root, detail=False)
+    except FileNotFoundError:
+        st.sidebar.error(f"GCS path not found: {search_root}")
+        return []
+    except Exception as exc:  # pragma: no cover
+        st.sidebar.error(f"Failed to inspect gs://{search_root}: {exc}")
+        return []
+
+    years: Set[int] = set()
+    for entry in entries:
+        name = entry.rstrip("/").split("/")[-1]
+        inferred = infer_year(name)
+        if inferred is not None:
+            years.add(inferred)
+
+    return sorted(years)
+
+
+@st.cache_data(show_spinner=True)
+def discover_gcs_files(
+    bucket: str,
+    prefix: str,
+    service_account_json: Optional[str],
+    years: Optional[Tuple[int, ...]] = None,
 ) -> List[FileMeta]:
     bucket = bucket.strip()
     if bucket.startswith("gs://"):
@@ -276,16 +328,25 @@ def discover_gcs_files(
         st.sidebar.error(f"GCS authentication failed: {exc}")
         return []
 
-    try:
-        objects = fs.find(search_root)
-    except FileNotFoundError:
-        st.sidebar.error(f"Bucket or prefix not found: {search_root}")
-        return []
-    except Exception as exc:  # pragma: no cover
-        st.sidebar.error(f"Failed to list gs://{search_root}: {exc}")
-        return []
+    search_roots = [search_root]
+    if years:
+        normalized_root = search_root.rstrip("/")
+        search_roots = [
+            f"{normalized_root}/{year}".lstrip("/") for year in sorted(set(years))
+        ]
 
-    csv_paths = sorted(f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv"))
+    csv_paths: List[str] = []
+    for root in search_roots:
+        try:
+            objects = fs.find(root)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:  # pragma: no cover
+            st.sidebar.error(f"Failed to list gs://{root}: {exc}")
+            continue
+        csv_paths.extend(f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv"))
+
+    csv_paths = sorted(csv_paths)
     if not csv_paths:
         return []
     return _build_file_meta(csv_paths)
@@ -854,7 +915,44 @@ def main() -> None:
         else:
             st.sidebar.warning("No service account JSON detected; relying on default credentials.")
 
-        files = discover_gcs_files(gcs_bucket, gcs_prefix, service_account_json)
+        available_years = discover_gcs_years(gcs_bucket, gcs_prefix, service_account_json)
+        selected_year_filters: Tuple[int, ...] = ()
+        if available_years:
+            default_year = max(available_years)
+            selected_year_filters = tuple(
+                st.sidebar.multiselect(
+                    "GCS reporting years",
+                    options=available_years,
+                    default=[default_year],
+                    format_func=lambda year: str(year),
+                    help="Only the chosen years will be scanned within the bucket.",
+                )
+            )
+            if not selected_year_filters:
+                st.warning("Select at least one year to begin exploring the GCS data.")
+                st.stop()
+        else:
+            manual_text = st.sidebar.text_input(
+                "GCS reporting years",
+                placeholder="e.g. 2023, 2024",
+                help="Enter one or more four-digit years separated by commas or spaces.",
+            )
+            manual_years = parse_year_tokens(manual_text)
+            if manual_years:
+                selected_year_filters = tuple(manual_years)
+            else:
+                st.warning(
+                    "Unable to auto-detect year folders. Provide at least one year above "
+                    "or configure a narrower prefix."
+                )
+                st.stop()
+
+        files = discover_gcs_files(
+            gcs_bucket,
+            gcs_prefix,
+            service_account_json,
+            years=selected_year_filters,
+        )
 
     if not files:
         if data_source == "Local folder":
