@@ -284,12 +284,12 @@ def _get_gcs_filesystem(service_account_json: Optional[str]):
 @st.cache_data(show_spinner=True)
 def discover_gcs_years(
     bucket: str, prefix: str, service_account_json: Optional[str]
-) -> List[int]:
+) -> Tuple[List[int], bool]:
     bucket = bucket.strip()
     if bucket.startswith("gs://"):
         bucket = bucket[5:]
     if not bucket:
-        return []
+        return [], False
 
     prefix = prefix.strip().lstrip("/")
     search_root = f"{bucket}/{prefix}" if prefix else bucket
@@ -298,25 +298,30 @@ def discover_gcs_years(
         fs = _get_gcs_filesystem(service_account_json)
     except Exception as exc:  # pragma: no cover - surfaced via UI
         st.sidebar.error(f"GCS authentication failed while listing years: {exc}")
-        return []
+        return [], False
 
     try:
         entries = fs.ls(search_root, detail=False)
     except FileNotFoundError:
         st.sidebar.error(f"GCS path not found: {search_root}")
-        return []
+        return [], False
     except Exception as exc:  # pragma: no cover
         st.sidebar.error(f"Failed to inspect gs://{search_root}: {exc}")
-        return []
+        return [], False
 
     years: Set[int] = set()
+    dir_years: Set[int] = set()
     for entry in entries:
-        name = entry.rstrip("/").split("/")[-1]
+        normalized = entry.rstrip("/")
+        name = normalized.split("/")[-1]
         inferred = infer_year(name)
         if inferred is not None:
             years.add(inferred)
+        if entry.endswith("/") and re.fullmatch(r"\d{4}", name):
+            dir_years.add(int(name))
 
-    return sorted(years)
+    use_year_dirs = len(dir_years) > 0
+    return sorted(years), use_year_dirs
 
 
 @st.cache_data(show_spinner=True)
@@ -325,6 +330,7 @@ def discover_gcs_files(
     prefix: str,
     service_account_json: Optional[str],
     years: Optional[Tuple[int, ...]] = None,
+    use_year_dirs: bool = False,
 ) -> List[FileMeta]:
     bucket = bucket.strip()
     if bucket.startswith("gs://"):
@@ -341,37 +347,34 @@ def discover_gcs_files(
         st.sidebar.error(f"GCS authentication failed: {exc}")
         return []
 
-    search_roots = [search_root]
     year_filters: Tuple[int, ...] = tuple(sorted(set(years))) if years else ()
-    if year_filters:
-        normalized_root = search_root.rstrip("/")
-        search_roots = [f"{normalized_root}/{year}".lstrip("/") for year in year_filters]
 
     csv_paths: List[str] = []
-    for root in search_roots:
-        try:
-            objects = fs.find(root)
-        except FileNotFoundError:
-            continue
-        except Exception as exc:  # pragma: no cover
-            st.sidebar.error(f"Failed to list gs://{root}: {exc}")
-            continue
-        csv_paths.extend(f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv"))
-
-    if not csv_paths and year_filters:
-        st.sidebar.warning(
-            "Year-specific folders not found; searching the entire prefix instead."
-        )
+    if year_filters and use_year_dirs:
+        normalized_root = search_root.rstrip("/")
+        search_roots = [f"{normalized_root}/{year}".lstrip("/") for year in year_filters]
+        for root in search_roots:
+            try:
+                objects = fs.find(root)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:  # pragma: no cover
+                st.sidebar.error(f"Failed to list gs://{root}: {exc}")
+                continue
+            csv_paths.extend(f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv"))
+        if not csv_paths and year_filters:
+            st.sidebar.info("Falling back to prefix-wide scan; year folders not found.")
+    if not csv_paths:
         try:
             objects = fs.find(search_root)
+        except FileNotFoundError:
+            return []
         except Exception as exc:  # pragma: no cover
             st.sidebar.error(f"Failed to list gs://{search_root}: {exc}")
             return []
-        csv_paths = [
-            f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv")
-        ]
+        csv_paths = [f"gs://{obj}" for obj in objects if obj.lower().endswith(".csv")]
 
-    if year_filters and csv_paths:
+    if year_filters:
         csv_paths = filter_paths_by_year(csv_paths, year_filters)
 
     csv_paths = sorted(csv_paths)
@@ -943,7 +946,9 @@ def main() -> None:
         else:
             st.sidebar.warning("No service account JSON detected; relying on default credentials.")
 
-        available_years = discover_gcs_years(gcs_bucket, gcs_prefix, service_account_json)
+        available_years, use_year_dirs = discover_gcs_years(
+            gcs_bucket, gcs_prefix, service_account_json
+        )
         selected_year_filters: Tuple[int, ...] = ()
         if available_years:
             default_year = max(available_years)
@@ -980,6 +985,7 @@ def main() -> None:
             gcs_prefix,
             service_account_json,
             years=selected_year_filters,
+            use_year_dirs=use_year_dirs,
         )
 
     if not files:
