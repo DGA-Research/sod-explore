@@ -59,6 +59,9 @@ QUARTER_TOKENS: List[Tuple[str, Tuple[str, str]]] = [
 ]
 
 QUARTER_SORT_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+YEAR_FILENAME_OVERRIDES = {
+    "JULY-SEPTEMBER-SOD-SUMMARY-GRID-FINAL.CSV": 2023,
+}
 DATE_FORMATS = ("%d-%b-%y", "%d-%b-%Y", "%m/%d/%Y")
 PERSON_PREFIX_PATTERN = re.compile(
     r"^(THE\s+HONORABLE|THE\s+HON\.|HONORABLE|HON\.?|REPRESENTATIVE|REP\.?|SENATOR|SEN\.?|DELEGATE|DEL\.?|RESIDENT\s+COMMISSIONER)\s+",
@@ -202,6 +205,9 @@ def infer_data_type(name: str) -> str:
 
 
 def infer_year(name: str) -> Optional[int]:
+    normalized_name = normalize_name(name)
+    if normalized_name in YEAR_FILENAME_OVERRIDES:
+        return YEAR_FILENAME_OVERRIDES[normalized_name]
     match = re.search(r"(20\d{2}|19\d{2})", name)
     if match:
         return int(match.group(1))
