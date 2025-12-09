@@ -976,7 +976,7 @@ def main() -> None:
     st.title("Statement of Disbursements Explorer")
     st.caption("Interactively analyze SOD summary/detail CSV files with custom filters.")
 
-    data_source = st.sidebar.radio("Data source", options=["Local folder", "GCS bucket"], index=0)
+    data_source = st.sidebar.radio("Data source", options=["Local folder", "GCS bucket"], index=1)
     files: List[FileMeta] = []
 
     storage_options: Optional[Dict[str, object]] = None
@@ -1017,12 +1017,11 @@ def main() -> None:
         )
         selected_year_filters: Tuple[int, ...] = ()
         if available_years:
-            default_year = max(available_years)
             selected_year_filters = tuple(
                 st.sidebar.multiselect(
                     "GCS reporting years",
                     options=available_years,
-                    default=[default_year],
+                    default=[],
                     format_func=lambda year: str(year),
                     help="Only the chosen years will be scanned within the bucket.",
                 )
