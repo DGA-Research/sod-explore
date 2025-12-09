@@ -348,6 +348,11 @@ def discover_gcs_files(
 
     csv_paths = sorted(csv_paths)
     if not csv_paths:
+        if years:
+            st.sidebar.warning(
+                "No files matched the selected year folders; scanning the entire prefix (may be slower)."
+            )
+            return discover_gcs_files(bucket, prefix, service_account_json, years=None)
         return []
     return _build_file_meta(csv_paths)
 
