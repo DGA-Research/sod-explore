@@ -516,7 +516,10 @@ def load_data(
     return pd.concat(frames, ignore_index=True)
 
 
-def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta], List[Optional[int]]]:
+def sidebar_dataset_picker(
+    files: List[FileMeta],
+    preselected_years: Optional[Iterable[Optional[int]]] = None,
+) -> Tuple[str, List[FileMeta], List[Optional[int]]]:
     st.sidebar.header("Dataset")
 
     data_type = st.sidebar.selectbox("Data type", options=["Summary", "Detail"], index=0)
@@ -546,21 +549,38 @@ def sidebar_dataset_picker(files: List[FileMeta]) -> Tuple[str, List[FileMeta], 
         label_to_files[label] = metas
 
     default_selection: List[str] = []
+    preselected_set = {int(year) for year in preselected_years or [] if year is not None}
+    if preselected_set:
+        for year, label in zip(sorted_years, option_labels):
+            if year is not None and year in preselected_set:
+                default_selection.append(label)
+        default_selection = default_selection or []
     known_years = [year for year in sorted_years if year is not None]
-    if known_years:
+    if not default_selection and known_years:
         latest_year = max(known_years)
         label_prefix = year_label(latest_year)
         for label in option_labels:
             if label.startswith(label_prefix):
                 default_selection = [label]
                 break
-    elif option_labels:
+    elif not default_selection and option_labels:
         default_selection = [option_labels[-1]]
+
+    widget_key = "reporting_years_multiselect"
+    if preselected_set:
+        preselected_labels = [
+            label
+            for year, label in zip(sorted_years, option_labels)
+            if year is not None and year in preselected_set
+        ]
+        if preselected_labels:
+            st.session_state[widget_key] = preselected_labels
 
     selected_labels = st.sidebar.multiselect(
         "Reporting years",
         options=option_labels,
         default=default_selection,
+        key=widget_key,
     )
     selected_files = [meta for label in selected_labels for meta in label_to_files.get(label, [])]
     selected_years_set = {
@@ -894,17 +914,9 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     st.subheader("Description trends")
     line_source = analysis_df.copy()
-    line_source["_PERIOD_LABEL"] = (
-        line_source["_SOURCE_YEAR"].fillna(0).astype(int).astype(str) + " " + line_source["_SOURCE_QUARTER"].fillna("")
-    ).str.strip()
-    line_source["_PERIOD_LABEL"] = line_source["_PERIOD_LABEL"].replace({"0": ""})
     if line_source.empty:
         st.caption("Insufficient quarter metadata to build the trends chart.")
     else:
-        line_source["_PERIOD_ORDER"] = (
-            line_source["_SOURCE_YEAR"].fillna(0).astype(int) * 10
-            + line_source["_SOURCE_QUARTER_ORDER"].fillna(0).astype(int)
-        )
         top_descriptions = (
             line_source.groupby("DESCRIPTION")["_ROW_VALUE"].sum().abs().sort_values(ascending=False).head(10).index
         )
@@ -915,20 +927,30 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
             st.caption("No description data available for the selected filters.")
         else:
             if value_column_upper.startswith("QTD"):
-                x_field = "_SOURCE_QUARTER"
-                line_source = line_source.dropna(subset=["_SOURCE_QUARTER"])
-                order_df = (
-                    line_source[["_SOURCE_QUARTER", "_SOURCE_QUARTER_ORDER"]]
-                    .drop_duplicates()
-                    .sort_values(["_SOURCE_QUARTER_ORDER"])
+                line_source = line_source.dropna(subset=["_SOURCE_YEAR", "_SOURCE_QUARTER"])
+                if line_source.empty:
+                    st.caption("No quarter data available for the selected filters.")
+                    return
+                line_source["_QTD_LABEL"] = (
+                    line_source["_SOURCE_YEAR"].astype(int).astype(str) + " " + line_source["_SOURCE_QUARTER"]
                 )
-            else:
-                x_field = "_PERIOD_LABEL"
-                line_source = line_source.dropna(subset=["_PERIOD_LABEL"])
+                x_field = "_QTD_LABEL"
                 order_df = (
-                    line_source[["_PERIOD_LABEL", "_SOURCE_YEAR", "_SOURCE_QUARTER_ORDER"]]
+                    line_source[["_QTD_LABEL", "_SOURCE_YEAR", "_SOURCE_QUARTER_ORDER"]]
                     .drop_duplicates()
                     .sort_values(["_SOURCE_YEAR", "_SOURCE_QUARTER_ORDER"])
+                )
+            else:
+                line_source = line_source.dropna(subset=["_SOURCE_YEAR"])
+                if line_source.empty:
+                    st.caption("No yearly data available for the selected filters.")
+                    return
+                line_source["_YEAR_LABEL"] = line_source["_SOURCE_YEAR"].astype(int).astype(str)
+                x_field = "_YEAR_LABEL"
+                order_df = (
+                    line_source[["_YEAR_LABEL", "_SOURCE_YEAR"]]
+                    .drop_duplicates()
+                    .sort_values(["_SOURCE_YEAR"])
                 )
 
             line_data = (
@@ -1180,7 +1202,9 @@ def main() -> None:
         st.error("No CSV files detected in the specified bucket/prefix.")
         st.stop()
 
-    data_type, selected_files, selected_years = sidebar_dataset_picker(files)
+    data_type, selected_files, selected_years = sidebar_dataset_picker(
+        files, preselected_years=selected_year_filters
+    )
     if not selected_files:
         st.warning("Pick at least one reporting period to begin exploring the data.")
         st.stop()
