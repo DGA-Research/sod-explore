@@ -63,6 +63,7 @@ PERSON_PREFIX_PATTERN = re.compile(
     r"^(THE\s+HONORABLE|THE\s+HON\.|HONORABLE|HON\.?|REPRESENTATIVE|REP\.?|SENATOR|SEN\.?|DELEGATE|DEL\.?|RESIDENT\s+COMMISSIONER)\s+",
     re.IGNORECASE,
 )
+LEADING_YEAR_PATTERN = re.compile(r"^\d{4}\s+")
 REMOTE_SCHEMES = ("gs://",)
 SUMMARY_GROUP_COLUMNS = (
     "ORGANIZATION",
@@ -468,6 +469,15 @@ def extract_person_name(value: object) -> Optional[str]:
     return name
 
 
+def canonicalize_organization_label(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    text = LEADING_YEAR_PATTERN.sub("", text)
+    text = text.strip(" ,.-")
+    return " ".join(text.split())
+
+
 @st.cache_data(show_spinner=True)
 def load_data(
     file_paths: Tuple[str, ...],
@@ -579,8 +589,24 @@ def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]
         else:
             filters["person"] = st.sidebar.multiselect("Person", options=person_options)
 
+    if "ORGANIZATION" in df.columns:
+        raw_options = sorted(df["ORGANIZATION"].dropna().unique())
+        org_entries: Dict[str, Dict[str, object]] = {}
+        for raw in raw_options:
+            cleaned = canonicalize_organization_label(raw) or raw
+            key = cleaned.upper()
+            entry = org_entries.setdefault(key, {"label": cleaned, "values": set()})
+            entry["values"].add(raw)
+        org_label_map = {entry["label"]: entry["values"] for entry in org_entries.values()}
+        org_labels = sorted(org_label_map.keys())
+        filters["organization_labels"] = st.sidebar.multiselect(
+            "Organization",
+            options=org_labels,
+            help="Select one or more organizations (searchable; years removed).",
+        )
+        filters["_organization_label_map"] = org_label_map
+
     column_configs = [
-        ("ORGANIZATION", "organization"),
         ("PROGRAM", "program"),
         ("BUDGET OBJECT CLASS", "boc"),
         ("BUDGET OBJECT CODE", "boc_code"),
@@ -589,15 +615,10 @@ def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]
         if column_label not in df.columns:
             continue
         options = sorted(df[column_label].dropna().unique())
-        if column_label == "ORGANIZATION":
-            filters[filter_key] = st.sidebar.multiselect(
-                column_label.title(), options=options, help="Select one or more organizations (searchable)."
-            )
+        if len(options) > SIDEBAR_OPTION_LIMIT:
+            filters[f"{filter_key}_query"] = st.sidebar.text_input(f"{column_label.title()} contains")
         else:
-            if len(options) > SIDEBAR_OPTION_LIMIT:
-                filters[f"{filter_key}_query"] = st.sidebar.text_input(f"{column_label.title()} contains")
-            else:
-                filters[filter_key] = st.sidebar.multiselect(column_label.title(), options=options)
+            filters[filter_key] = st.sidebar.multiselect(column_label.title(), options=options)
 
     if data_type == "Detail" and "VENDOR NAME" in df.columns:
         filters["vendor_query"] = st.sidebar.text_input("Vendor contains")
@@ -644,8 +665,15 @@ def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]
 def apply_filters(df: pd.DataFrame, filters: Dict[str, object], data_type: str) -> pd.DataFrame:
     filtered = df.copy()
 
+    org_labels = filters.get("organization_labels")
+    org_map = filters.get("_organization_label_map", {})
+    if org_labels:
+        allowed_values: Set[str] = set()
+        for label in org_labels:
+            allowed_values.update(org_map.get(label, set()))
+        filtered = filtered[filtered["ORGANIZATION"].isin(allowed_values)]
+
     column_map = {
-        "organization": "ORGANIZATION",
         "program": "PROGRAM",
         "boc": "BUDGET OBJECT CLASS",
         "boc_code": "BUDGET OBJECT CODE",
