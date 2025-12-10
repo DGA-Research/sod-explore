@@ -64,6 +64,7 @@ PERSON_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 LEADING_YEAR_PATTERN = re.compile(r"^\d{4}\s+")
+FISCAL_YEAR_PATTERN = re.compile(r"^FISCAL\s+YEAR\s+\d{4}\s+", re.IGNORECASE)
 REMOTE_SCHEMES = ("gs://",)
 SUMMARY_GROUP_COLUMNS = (
     "ORGANIZATION",
@@ -474,6 +475,7 @@ def canonicalize_organization_label(value: object) -> str:
         return ""
     text = value.strip()
     text = LEADING_YEAR_PATTERN.sub("", text)
+    text = FISCAL_YEAR_PATTERN.sub("", text)
     text = text.strip(" ,.-")
     return " ".join(text.split())
 
