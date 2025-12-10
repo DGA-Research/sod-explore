@@ -805,24 +805,28 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     analysis_df = _drop_total_rows(df)
 
-    if amount_column.upper().startswith("YTD"):
-        annotated = _annotate_summary_period(analysis_df)
-        mask = (annotated["_SOURCE_YEAR"] == 2016) & (annotated["_SOURCE_QUARTER"] == "Q4")
-        if mask.any():
-            analysis_df = analysis_df.loc[mask].copy()
-            value_series = analysis_df[amount_column].astype(float)
-        else:
-            value_series = _prepare_summary_values(analysis_df, amount_column)
+    value_column_upper = amount_column.upper()
+    summary_df = analysis_df.copy()
+
+    if value_column_upper.startswith("YTD") and "QTD AMOUNT" in analysis_df.columns:
+        group_fields = ["ORGANIZATION", "PROGRAM", "DESCRIPTION"]
+        grouped = (
+            analysis_df.groupby(group_fields, dropna=False)["QTD AMOUNT"]
+            .sum()
+            .reset_index()
+        )
+        summary_df = grouped.rename(columns={"QTD AMOUNT": "_VALUE"})
     else:
         value_series = _prepare_summary_values(analysis_df, amount_column)
-    analysis_df = analysis_df.assign(_VALUE=value_series)
-    if analysis_df["_VALUE"].empty:
+        summary_df = analysis_df.assign(_VALUE=value_series)
+
+    if summary_df["_VALUE"].empty:
         st.info("Unable to compute summary values for the selected column.")
         return
 
-    total_value = analysis_df["_VALUE"].sum()
-    avg_value = analysis_df["_VALUE"].mean()
-    unique_programs = analysis_df.get("PROGRAM", pd.Series(dtype=str)).nunique(dropna=True)
+    total_value = summary_df["_VALUE"].sum()
+    avg_value = summary_df["_VALUE"].mean()
+    unique_programs = summary_df.get("PROGRAM", pd.Series(dtype=str)).nunique(dropna=True)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Aggregate value", f"${total_value:,.0f}")
@@ -831,7 +835,7 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     st.subheader("Top descriptions")
     top_desc = (
-        analysis_df.groupby("DESCRIPTION")["_VALUE"]
+        summary_df.groupby("DESCRIPTION")["_VALUE"]
         .sum()
         .sort_values(ascending=False)
         .head(10)
@@ -841,7 +845,7 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     st.subheader("Organizations by value")
     org_chart = (
-        analysis_df.groupby("ORGANIZATION")["_VALUE"]
+        summary_df.groupby("ORGANIZATION")["_VALUE"]
         .sum()
         .sort_values(ascending=False)
         .head(10)
