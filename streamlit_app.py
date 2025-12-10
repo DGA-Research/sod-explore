@@ -805,33 +805,33 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
 
     analysis_df = _drop_total_rows(df)
 
-    value_column_upper = amount_column.upper()
-    summary_df = analysis_df.copy()
+    row_values = _prepare_summary_values(analysis_df, amount_column)
+    annotated = _annotate_summary_period(analysis_df)
+    analysis_df = analysis_df.assign(
+        _ROW_VALUE=row_values,
+        _SOURCE_YEAR=annotated["_SOURCE_YEAR"],
+        _SOURCE_QUARTER=annotated["_SOURCE_QUARTER"],
+        _SOURCE_QUARTER_ORDER=annotated["_SOURCE_QUARTER_ORDER"],
+    )
 
+    value_column_upper = amount_column.upper()
     if value_column_upper.startswith("YTD") and "QTD AMOUNT" in analysis_df.columns:
         group_fields = ["ORGANIZATION", "PROGRAM", "DESCRIPTION"]
-        grouped = (
+        summary_df = (
             analysis_df.groupby(group_fields, dropna=False)["QTD AMOUNT"]
             .sum()
             .reset_index()
+            .rename(columns={"QTD AMOUNT": "_VALUE"})
         )
-        summary_df = grouped.rename(columns={"QTD AMOUNT": "_VALUE"})
     else:
-        value_series = _prepare_summary_values(analysis_df, amount_column)
-        summary_df = analysis_df.assign(_VALUE=value_series)
+        summary_df = analysis_df.assign(_VALUE=analysis_df["_ROW_VALUE"])
 
     if summary_df["_VALUE"].empty:
         st.info("Unable to compute summary values for the selected column.")
         return
 
     total_value = summary_df["_VALUE"].sum()
-    avg_value = summary_df["_VALUE"].mean()
-    unique_programs = summary_df.get("PROGRAM", pd.Series(dtype=str)).nunique(dropna=True)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Aggregate value", f"${total_value:,.0f}")
-    c2.metric("Mean row value", f"${avg_value:,.0f}")
-    c3.metric("Programs represented", f"{unique_programs:,}")
+    st.metric("Aggregate value", f"${total_value:,.0f}")
 
     st.subheader("Top descriptions")
     top_desc = (
@@ -843,14 +843,42 @@ def render_summary_view(df: pd.DataFrame, amount_column: Optional[str]) -> None:
     )
     st.dataframe(top_desc)
 
-    st.subheader("Organizations by value")
-    org_chart = (
-        summary_df.groupby("ORGANIZATION")["_VALUE"]
-        .sum()
-        .sort_values(ascending=False)
-        .head(10)
-    )
-    st.bar_chart(org_chart)
+    st.subheader("Description trends")
+    line_source = analysis_df.dropna(subset=["_SOURCE_YEAR", "_SOURCE_QUARTER"]).copy()
+    if line_source.empty:
+        st.caption("Insufficient quarter metadata to build the trends chart.")
+    else:
+        line_source["_PERIOD_LABEL"] = line_source["_SOURCE_YEAR"].astype(int).astype(str) + " " + line_source["_SOURCE_QUARTER"]
+        line_source["_PERIOD_ORDER"] = (
+            line_source["_SOURCE_YEAR"].fillna(0).astype(int) * 10
+            + line_source["_SOURCE_QUARTER_ORDER"].fillna(0).astype(int)
+        )
+        top_descriptions = (
+            line_source.groupby("DESCRIPTION")["_ROW_VALUE"].sum().abs().sort_values(ascending=False).head(10).index
+        )
+        line_source = line_source[line_source["DESCRIPTION"].isin(top_descriptions)]
+        if line_source.empty:
+            st.caption("No description data available for the selected filters.")
+        else:
+            line_data = (
+                line_source.groupby(
+                    ["_SOURCE_YEAR", "_SOURCE_QUARTER_ORDER", "_PERIOD_LABEL", "DESCRIPTION"],
+                    dropna=False,
+                )["_ROW_VALUE"]
+                .sum()
+                .reset_index()
+            )
+            pivot = (
+                line_data.pivot(index="_PERIOD_LABEL", columns="DESCRIPTION", values="_ROW_VALUE")
+                .fillna(0)
+            )
+            order = (
+                line_data[["_PERIOD_LABEL", "_SOURCE_YEAR", "_SOURCE_QUARTER_ORDER"]]
+                .drop_duplicates()
+                .sort_values(["_SOURCE_YEAR", "_SOURCE_QUARTER_ORDER"])
+            )
+            pivot = pivot.reindex(order["_PERIOD_LABEL"].tolist())
+            st.line_chart(pivot)
 
 
 def render_data_preview(
