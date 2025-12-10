@@ -579,14 +579,21 @@ def build_filter_controls(df: pd.DataFrame, data_type: str) -> Dict[str, object]
         else:
             filters["person"] = st.sidebar.multiselect("Person", options=person_options)
 
-    for column_label, filter_key in (
+    column_configs = [
         ("ORGANIZATION", "organization"),
         ("PROGRAM", "program"),
         ("BUDGET OBJECT CLASS", "boc"),
         ("BUDGET OBJECT CODE", "boc_code"),
-    ):
-        if column_label in df.columns:
-            options = sorted(df[column_label].dropna().unique())
+    ]
+    for column_label, filter_key in column_configs:
+        if column_label not in df.columns:
+            continue
+        options = sorted(df[column_label].dropna().unique())
+        if column_label == "ORGANIZATION":
+            filters[filter_key] = st.sidebar.multiselect(
+                column_label.title(), options=options, help="Select one or more organizations (searchable)."
+            )
+        else:
             if len(options) > SIDEBAR_OPTION_LIMIT:
                 filters[f"{filter_key}_query"] = st.sidebar.text_input(f"{column_label.title()} contains")
             else:
